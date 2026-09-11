@@ -1,0 +1,227 @@
+/* Cowrite AI 控制台样式（移动端友好，使用 Obsidian CSS 变量） */
+
+.cowrite-console {
+  padding: 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow-y: auto;
+  /* 移动端宽度自适应，不写死最大宽度 */
+}
+
+.cowrite-console h2 {
+  margin: 0 0 4px 0;
+  font-size: 1.1em;
+}
+
+.cowrite-console h3 {
+  margin: 0 0 6px 0;
+  font-size: 0.95em;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--background-modifier-border);
+  padding-bottom: 4px;
+}
+
+.cowrite-status {
+  font-size: 0.8em;
+  color: var(--text-faint);
+  margin-bottom: 4px;
+}
+
+.cowrite-toolbar {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.cowrite-toolbar button,
+.cowrite-btn-small {
+  font-size: 0.85em;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: var(--interactive-normal);
+  color: var(--text-normal);
+  border: 1px solid var(--background-modifier-border);
+  cursor: pointer;
+  /* 移动端可点击区域不小于 32px */
+  min-height: 32px;
+}
+
+.cowrite-toolbar button:hover,
+.cowrite-btn-small:hover {
+  background: var(--interactive-hover);
+}
+
+.cowrite-section {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.cowrite-page-list,
+.cowrite-task-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.cowrite-empty {
+  color: var(--text-faint);
+  font-size: 0.85em;
+  padding: 6px 0;
+}
+
+.cowrite-page-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--background-secondary);
+}
+
+.cowrite-page-row:hover {
+  background: var(--background-modifier-hover);
+}
+
+.cowrite-page-name {
+  cursor: pointer;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cowrite-task-row {
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--background-secondary);
+  border-left: 3px solid var(--background-modifier-border);
+}
+
+.cowrite-task-row.cowrite-task-running {
+  border-left-color: var(--color-yellow);
+}
+
+.cowrite-task-row.cowrite-task-succeeded {
+  border-left-color: var(--color-green);
+}
+
+.cowrite-task-row.cowrite-task-failed {
+  border-left-color: var(--color-red);
+}
+
+.cowrite-task-row.cowrite-task-cancelled {
+  opacity: 0.6;
+}
+
+.cowrite-task-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 2px;
+  flex-wrap: wrap;
+}
+
+.cowrite-task-action {
+  font-weight: 600;
+  font-size: 0.9em;
+}
+
+.cowrite-task-status {
+  font-size: 0.75em;
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: var(--background-modifier-border);
+}
+
+.cowrite-task-status-queued {
+  color: var(--text-muted);
+}
+
+.cowrite-task-status-running {
+  color: var(--color-yellow);
+}
+
+.cowrite-task-status-succeeded {
+  color: var(--color-green);
+}
+
+.cowrite-task-status-failed {
+  color: var(--color-red);
+}
+
+.cowrite-task-status-cancelled {
+  color: var(--text-faint);
+}
+
+.cowrite-task-meta {
+  font-size: 0.8em;
+  color: var(--text-muted);
+  word-break: break-word;
+}
+
+.cowrite-task-result {
+  font-size: 0.8em;
+  color: var(--color-green);
+  word-break: break-word;
+}
+
+.cowrite-task-error {
+  font-size: 0.8em;
+  color: var(--color-red);
+  word-break: break-word;
+}
+
+.cowrite-task-ops {
+  margin-top: 4px;
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.cowrite-input {
+  width: 100%;
+  margin: 4px 0;
+}
+
+.cowrite-textarea {
+  width: 100%;
+  min-height: 80px;
+  margin: 4px 0;
+  box-sizing: border-box;
+}
+
+.cowrite-modal-btns {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+
+.cowrite-modal-btns button {
+  padding: 6px 14px;
+  border-radius: 6px;
+  background: var(--interactive-normal);
+  border: 1px solid var(--background-modifier-border);
+  cursor: pointer;
+  min-height: 32px;
+}
+
+.cowrite-desc {
+  color: var(--text-muted);
+  font-size: 0.85em;
+}
+
+/* 窄屏（移动端）适配 */
+@media (max-width: 480px) {
+  .cowrite-toolbar {
+    gap: 4px;
+  }
+  .cowrite-toolbar button,
+  .cowrite-btn-small {
+    flex: 1 1 auto;
+    padding: 6px 8px;
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "name": "obsidian-cowrite-ai",
+  "version": "0.1.0",
+  "description": "Obsidian 上自托管、自带 LLM 执行引擎的 Cowrite 写作平台（移动端可用）",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "version": "node version-bump.mjs && git add manifest.json versions.json"
+  },
+  "keywords": ["obsidian", "cowrite", "writing", "ai", "llm"],
+  "author": "Daligulu",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "esbuild": "^0.21.5",
+    "obsidian": "^1.5.7",
+    "tslib": "^2.6.3",
+    "typescript": "^5.5.3"
+  }
+}

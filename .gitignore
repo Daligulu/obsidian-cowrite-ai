@@ -1,0 +1,5 @@
+node_modules/
+*.zip
+.DS_Store
+.obsidian/
+# 注意：main.js 不能 ignore，BRAT 需要仓库根目录直接包含构建产物
