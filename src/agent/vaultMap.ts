@@ -52,13 +52,13 @@ export class VaultMap {
     }
   }
 
-  /** 同步尝试从缓存加载（不阻塞首屏） */
+  /** 同步尝试从缓存加载（不阻塞首屏），用 adapter 绕开 iOS 索引延迟 */
   async loadFromCache(): Promise<boolean> {
     if (this.nodes.size > 0) return true;
-    const file = this.vault.getAbstractFileByPath(this.cachePath);
-    if (!(file instanceof TFile)) return false;
     try {
-      const raw = await this.vault.cachedRead(file);
+      const exists = await this.vault.adapter.exists(this.cachePath);
+      if (!exists) return false;
+      const raw = await this.vault.adapter.read(this.cachePath);
       const data = JSON.parse(raw) as CacheShape;
       if (Array.isArray(data.nodes)) {
         this.nodes.clear();
@@ -118,16 +118,10 @@ export class VaultMap {
         builtAt: new Date().toISOString(),
         nodes: Array.from(this.nodes.values()),
       };
-      const existing = this.vault.getAbstractFileByPath(this.cachePath);
-      if (existing instanceof TFile) {
-        await this.vault.modify(existing, JSON.stringify(data));
-      } else {
-        const parent = '.cowrite';
-        if (!this.vault.getAbstractFileByPath(parent)) {
-          await this.vault.createFolder(parent);
-        }
-        await this.vault.create(this.cachePath, JSON.stringify(data));
-      }
+      try {
+        await this.vault.adapter.mkdir('.cowrite');
+      } catch {}
+      await this.vault.adapter.write(this.cachePath, JSON.stringify(data));
     } catch (e) {
       console.warn('Cowrite AI: write vault-map cache failed', e);
     }

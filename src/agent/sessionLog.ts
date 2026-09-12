@@ -1,10 +1,9 @@
-import { TFile, Vault } from 'obsidian';
+import { Vault } from 'obsidian';
 import type { ChatMessage } from './providers/llm';
 
 /**
  * 会话日志：append-only JSONL，存到 <vault>/.cowrite/sessions/<taskId>.jsonl。
- * 每行一条记录，可随时从全文派生回 OpenAI 消息历史。
- * 纯 vault API，无 Node 依赖，移动端可用。
+ * 用 vault.adapter 绕开 iOS Obsidian 对隐藏路径的索引延迟。
  */
 
 /** 会话内记录类型（持久化到 JSONL 的形态） */
@@ -28,23 +27,23 @@ export class SessionLog {
     this.filePath = `.cowrite/sessions/${taskId}.jsonl`;
   }
 
-  /** 追加一条记录（原子 read-modify-write，文件不存在则创建） */
+  /** 追加一条记录（read-modify-write，文件不存在则创建） */
   async append(record: SessionRecord): Promise<void> {
     await this.ensureFile();
-    const file = this.vault.getAbstractFileByPath(this.filePath);
-    if (!(file instanceof TFile)) return;
-    await this.vault.process(file, (raw) => {
-      return (raw ?? '') + JSON.stringify(record) + '\n';
-    });
+    let raw = '';
+    try {
+      raw = await this.vault.adapter.read(this.filePath);
+    } catch {
+      raw = '';
+    }
+    await this.vault.adapter.write(this.filePath, raw + JSON.stringify(record) + '\n');
   }
 
   /** 读取全部记录（损坏行跳过） */
   async readAll(): Promise<SessionRecord[]> {
-    const file = this.vault.getAbstractFileByPath(this.filePath);
-    if (!(file instanceof TFile)) return [];
     let raw: string;
     try {
-      raw = await this.vault.cachedRead(file);
+      raw = await this.vault.adapter.read(this.filePath);
     } catch {
       return [];
     }
@@ -55,7 +54,7 @@ export class SessionLog {
       try {
         out.push(JSON.parse(trimmed) as SessionRecord);
       } catch {
-        // 损坏行跳过，不中断会话
+        // 损坏行跳过
       }
     }
     return out;
@@ -63,10 +62,6 @@ export class SessionLog {
 
   /**
    * 从记录派生 OpenAI 兼容消息历史。
-   * - user → user
-   * - assistant（含 toolCalls）→ assistant + tool_calls
-   * - tool → tool（带 tool_call_id）
-   * - system-note → system（压缩摘要等）
    */
   async deriveModelHistory(): Promise<ChatMessage[]> {
     const records = await this.readAll();
@@ -104,22 +99,19 @@ export class SessionLog {
     return messages;
   }
 
-  /** 确保会话文件存在（含父目录） */
+  /** 确保会话文件存在（含父目录），用 vault.adapter */
   private async ensureFile(): Promise<void> {
-    const existing = this.vault.getAbstractFileByPath(this.filePath);
-    if (existing instanceof TFile) return;
     const parent = this.filePath.split('/').slice(0, -1).join('/');
-    if (parent && !this.vault.getAbstractFileByPath(parent)) {
+    if (parent) {
       try {
-        await this.vault.createFolder(parent);
+        await this.vault.adapter.mkdir(parent);
       } catch {
-        // 已存在则忽略
+        // 已存在忽略
       }
     }
-    try {
-      await this.vault.create(this.filePath, '');
-    } catch {
-      // 竞态：已被其他并发会话创建
+    const exists = await this.vault.adapter.exists(this.filePath);
+    if (!exists) {
+      await this.vault.adapter.write(this.filePath, '');
     }
   }
 }

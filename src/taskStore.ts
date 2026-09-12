@@ -1,4 +1,4 @@
-import { Notice, TFile, Vault } from 'obsidian';
+import { Notice, Vault } from 'obsidian';
 import type { CowriteTask, CowriteTaskInput, TaskDataFile, TaskStatus } from './types';
 
 /**
@@ -185,62 +185,55 @@ export class TaskStore {
   }
 
   private async readData(): Promise<TaskDataFile | null> {
-    const file = this.vault.getAbstractFileByPath(this.tasksFile);
-    if (!(file instanceof TFile)) return null;
     try {
-      const raw = await this.vault.cachedRead(file);
+      const exists = await this.vault.adapter.exists(this.tasksFile);
+      if (!exists) return null;
+      const raw = await this.vault.adapter.read(this.tasksFile);
       return JSON.parse(raw) as TaskDataFile;
     } catch (e) {
-      console.error('Cowrite AI: failed to parse tasks.json', e);
+      console.error('Cowrite AI: failed to read tasks.json', e);
       return null;
     }
   }
 
-  /** 原子读改写 tasks.json；文件不存在则创建 */
+  /** 读改写 tasks.json（用 vault.adapter 绕开 iOS 索引延迟）；文件不存在则创建 */
   private async mutate(fn: (tasks: CowriteTask[]) => CowriteTask[]): Promise<void> {
     await this.ensureFile();
-    const file = this.vault.getAbstractFileByPath(this.tasksFile);
-    if (!(file instanceof TFile)) {
-      new Notice('Cowrite AI: 无法访问任务文件 ' + this.tasksFile);
-      return;
+    // read
+    let raw = '';
+    try {
+      raw = await this.vault.adapter.read(this.tasksFile);
+    } catch {
+      raw = '{"version":1,"tasks":[]}';
     }
-    await this.vault.process(file, (raw) => {
-      let data: TaskDataFile;
-      try {
-        data = JSON.parse(raw || '{"version":1,"tasks":[]}') as TaskDataFile;
-      } catch {
-        data = { version: 1, tasks: [] };
-      }
-      data.tasks = fn(data.tasks ?? []);
-      data.updatedAt = new Date().toISOString();
-      return JSON.stringify(data, null, 2);
-    });
+    let data: TaskDataFile;
+    try {
+      data = JSON.parse(raw) as TaskDataFile;
+    } catch {
+      data = { version: 1, tasks: [] };
+    }
+    data.tasks = fn(data.tasks ?? []);
+    data.updatedAt = new Date().toISOString();
+    // write
+    await this.vault.adapter.write(this.tasksFile, JSON.stringify(data, null, 2));
   }
 
-  /** 确保 tasks.json 存在（含父目录） */
+  /** 确保 tasks.json 存在（含父目录），用 vault.adapter 绕开 iOS 索引延迟 */
   private async ensureFile(): Promise<void> {
-    const existing = this.vault.getAbstractFileByPath(this.tasksFile);
-    if (existing instanceof TFile) return;
     const parent = this.tasksFile.split('/').slice(0, -1).join('/');
     if (parent) {
-      const parentFolder = this.vault.getAbstractFileByPath(parent);
-      if (!parentFolder) {
-        try {
-          await this.vault.createFolder(parent);
-        } catch (e) {
-          // 移动端 getAbstractFileByPath 对隐藏目录可能返回 null 但实际已存在，忽略 "already exists"
-          if (!(e instanceof Error && /already exists/i.test(e.message))) {
-            throw e;
-          }
-        }
+      try {
+        await this.vault.adapter.mkdir(parent);
+      } catch {
+        // 目录已存在或创建失败都忽略，后面 write 会处理
       }
     }
-    try {
-      await this.vault.create(this.tasksFile, JSON.stringify({ version: 1, tasks: [] } as TaskDataFile, null, 2));
-    } catch (e) {
-      if (!(e instanceof Error && /already exists/i.test(e.message))) {
-        throw e;
-      }
+    const exists = await this.vault.adapter.exists(this.tasksFile);
+    if (!exists) {
+      await this.vault.adapter.write(
+        this.tasksFile,
+        JSON.stringify({ version: 1, tasks: [] } as TaskDataFile, null, 2),
+      );
     }
   }
 

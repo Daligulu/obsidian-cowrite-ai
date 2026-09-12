@@ -1,11 +1,9 @@
-import { TFile, Vault } from 'obsidian';
+import { Vault } from 'obsidian';
 
 /**
  * 长期记忆（借鉴 Mastra observational memory）。
  * 存储：<vault>/agent/memory.md，bullet list 形态。
- * 会话结束时让模型抽 0-5 条 observation append；
- * 下次启动按当前任务关键词做简单全文匹配，命中条目注入 system prompt。
- * 不引向量库，纯字符串匹配，移动端友好。
+ * 用 vault.adapter 绕开 iOS 索引延迟。
  */
 export class MemoryStore {
   private vault: Vault;
@@ -15,13 +13,11 @@ export class MemoryStore {
     this.vault = vault;
   }
 
-  /** 读取所有 observation 条目（去掉前缀 "- " 与时间戳） */
+  /** 读取所有 observation 条目 */
   async list(): Promise<string[]> {
-    const file = this.vault.getAbstractFileByPath(this.memoryPath);
-    if (!(file instanceof TFile)) return [];
     let raw: string;
     try {
-      raw = await this.vault.cachedRead(file);
+      raw = await this.vault.adapter.read(this.memoryPath);
     } catch {
       return [];
     }
@@ -29,14 +25,13 @@ export class MemoryStore {
     for (const line of raw.split('\n')) {
       const trimmed = line.trim();
       if (!trimmed.startsWith('- ')) continue;
-      // 去掉 "- YYYY-MM-DD: " 前缀
       const body = trimmed.replace(/^-\s+(\d{4}-\d{2}-\d{2}:\s*)?/, '').trim();
       if (body) out.push(body);
     }
     return out;
   }
 
-  /** 追加若干条 observation（带当天日期前缀） */
+  /** 追加若干条 observation */
   async append(observations: string[]): Promise<void> {
     const clean = observations
       .map((s) => (s || '').trim())
@@ -47,27 +42,23 @@ export class MemoryStore {
     const today = new Date().toISOString().slice(0, 10);
     const lines = clean.map((o) => `- ${today}: ${o}`).join('\n') + '\n';
 
-    const file = this.vault.getAbstractFileByPath(this.memoryPath);
-    if (!(file instanceof TFile)) {
-      // 首次创建：带标题
-      const parent = this.memoryPath.split('/').slice(0, -1).join('/');
-      if (!this.vault.getAbstractFileByPath(parent)) {
-        try {
-          await this.vault.createFolder(parent);
-        } catch {
-          // 忽略
-        }
-      }
-      await this.vault.create(this.memoryPath, `# Cowrite AI 长期记忆\n\n${lines}`);
-      return;
+    try {
+      await this.vault.adapter.mkdir('agent');
+    } catch {}
+
+    let existing = '';
+    try {
+      existing = await this.vault.adapter.read(this.memoryPath);
+    } catch {}
+
+    if (!existing) {
+      await this.vault.adapter.write(this.memoryPath, `# Cowrite AI 长期记忆\n\n${lines}`);
+    } else {
+      await this.vault.adapter.write(this.memoryPath, existing + lines);
     }
-    await this.vault.process(file, (raw) => (raw ?? '') + lines);
   }
 
-  /**
-   * 按关键词做简单全文匹配，返回命中的 observation。
-   * keywords 为空时返回最近 5 条（兜底）。
-   */
+  /** 按关键词做简单全文匹配 */
   async query(keywords: string[]): Promise<string[]> {
     const all = await this.list();
     if (all.length === 0) return [];
@@ -85,7 +76,6 @@ export class MemoryStore {
         }
       }
     }
-    // 命中超过 6 条取最近 6 条；没命中则兜底最近 3 条
     if (hit.length === 0) return all.slice(-3);
     return hit.slice(-6);
   }

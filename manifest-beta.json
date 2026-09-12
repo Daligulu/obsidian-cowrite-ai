@@ -1,7 +1,7 @@
 {
   "id": "cowrite-ai",
   "name": "Cowrite AI",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "minAppVersion": "1.0.0",
   "description": "Obsidian 上自托管、自带 LLM 执行引擎的 Cowrite 写作平台：页面库 + 任务队列，支持自定义 OpenAI 兼容模型 API，移动端可用。",
   "author": "Daligulu",
