@@ -1,227 +1,113 @@
-/* Cowrite AI 控制台样式（移动端友好，使用 Obsidian CSS 变量） */
-
-.cowrite-console {
-  padding: 8px 12px;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  overflow-y: auto;
-  /* 移动端宽度自适应，不写死最大宽度 */
-}
-
-.cowrite-console h2 {
-  margin: 0 0 4px 0;
-  font-size: 1.1em;
-}
-
-.cowrite-console h3 {
-  margin: 0 0 6px 0;
-  font-size: 0.95em;
-  color: var(--text-muted);
-  border-bottom: 1px solid var(--background-modifier-border);
-  padding-bottom: 4px;
-}
-
-.cowrite-status {
-  font-size: 0.8em;
-  color: var(--text-faint);
-  margin-bottom: 4px;
-}
+/* Cowrite AI 工具条样式（v0.3） */
 
 .cowrite-toolbar {
   display: flex;
-  gap: 6px;
-  flex-wrap: wrap;
-}
-
-.cowrite-toolbar button,
-.cowrite-btn-small {
-  font-size: 0.85em;
-  padding: 6px 10px;
-  border-radius: 6px;
-  background: var(--interactive-normal);
-  color: var(--text-normal);
-  border: 1px solid var(--background-modifier-border);
-  cursor: pointer;
-  /* 移动端可点击区域不小于 32px */
-  min-height: 32px;
-}
-
-.cowrite-toolbar button:hover,
-.cowrite-btn-small:hover {
-  background: var(--interactive-hover);
-}
-
-.cowrite-section {
-  display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 8px;
+  padding: 12px;
+  box-sizing: border-box;
+  width: 100%;
 }
 
-.cowrite-page-list,
-.cowrite-task-list {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.cowrite-empty {
-  color: var(--text-faint);
-  font-size: 0.85em;
-  padding: 6px 0;
-}
-
-.cowrite-page-row {
+.cowrite-toolbar-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
-  padding: 6px 8px;
-  border-radius: 6px;
-  background: var(--background-secondary);
+  margin-bottom: 4px;
 }
 
-.cowrite-page-row:hover {
-  background: var(--background-modifier-hover);
-}
-
-.cowrite-page-name {
-  cursor: pointer;
-  flex: 1;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.cowrite-task-row {
-  padding: 6px 8px;
-  border-radius: 6px;
-  background: var(--background-secondary);
-  border-left: 3px solid var(--background-modifier-border);
-}
-
-.cowrite-task-row.cowrite-task-running {
-  border-left-color: var(--color-yellow);
-}
-
-.cowrite-task-row.cowrite-task-succeeded {
-  border-left-color: var(--color-green);
-}
-
-.cowrite-task-row.cowrite-task-failed {
-  border-left-color: var(--color-red);
-}
-
-.cowrite-task-row.cowrite-task-cancelled {
-  opacity: 0.6;
-}
-
-.cowrite-task-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 2px;
-  flex-wrap: wrap;
-}
-
-.cowrite-task-action {
+.cowrite-toolbar-title {
   font-weight: 600;
-  font-size: 0.9em;
+  font-size: 13px;
+  opacity: 0.8;
 }
 
-.cowrite-task-status {
-  font-size: 0.75em;
-  padding: 1px 6px;
+.cowrite-gear {
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  font-size: 16px;
+  padding: 2px 6px;
+  border-radius: 6px;
+  color: var(--text-muted);
+}
+.cowrite-gear:hover {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+}
+
+.cowrite-action-btn {
+  width: 100%;
+  justify-content: flex-start;
+  text-align: left;
+  padding: 10px 12px;
+  font-size: 14px;
   border-radius: 8px;
-  background: var(--background-modifier-border);
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary);
+  color: var(--text-normal);
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, opacity 0.15s ease;
+}
+.cowrite-action-btn:hover {
+  background: var(--background-modifier-hover);
+  border-color: var(--background-modifier-border-hover);
+}
+.cowrite-action-btn.is-disabled,
+.cowrite-action-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 
-.cowrite-task-status-queued {
-  color: var(--text-muted);
+.cowrite-busy {
+  position: relative;
 }
-
-.cowrite-task-status-running {
-  color: var(--color-yellow);
+.cowrite-busy::after {
+  content: '';
+  position: absolute;
+  right: 10px;
+  top: 50%;
+  width: 12px;
+  height: 12px;
+  margin-top: -6px;
+  border: 2px solid var(--background-modifier-border);
+  border-top-color: var(--interactive-accent);
+  border-radius: 50%;
+  animation: cowrite-spin 0.8s linear infinite;
 }
-
-.cowrite-task-status-succeeded {
-  color: var(--color-green);
-}
-
-.cowrite-task-status-failed {
-  color: var(--color-red);
-}
-
-.cowrite-task-status-cancelled {
-  color: var(--text-faint);
-}
-
-.cowrite-task-meta {
-  font-size: 0.8em;
-  color: var(--text-muted);
-  word-break: break-word;
-}
-
-.cowrite-task-result {
-  font-size: 0.8em;
-  color: var(--color-green);
-  word-break: break-word;
-}
-
-.cowrite-task-error {
-  font-size: 0.8em;
-  color: var(--color-red);
-  word-break: break-word;
-}
-
-.cowrite-task-ops {
-  margin-top: 4px;
-  display: flex;
-  gap: 6px;
-  flex-wrap: wrap;
-}
-
-.cowrite-input {
-  width: 100%;
-  margin: 4px 0;
-}
-
-.cowrite-textarea {
-  width: 100%;
-  min-height: 80px;
-  margin: 4px 0;
-  box-sizing: border-box;
+@keyframes cowrite-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .cowrite-modal-btns {
   display: flex;
   gap: 8px;
   justify-content: flex-end;
-  margin-top: 8px;
+  margin-top: 12px;
 }
 
-.cowrite-modal-btns button {
-  padding: 6px 14px;
-  border-radius: 6px;
-  background: var(--interactive-normal);
-  border: 1px solid var(--background-modifier-border);
-  cursor: pointer;
-  min-height: 32px;
+.cowrite-input,
+select.cowrite-input {
+  width: 100%;
+  margin: 6px 0;
 }
 
 .cowrite-desc {
-  color: var(--text-muted);
-  font-size: 0.85em;
+  opacity: 0.7;
+  font-size: 12px;
+  margin-top: 8px;
 }
 
-/* 窄屏（移动端）适配 */
-@media (max-width: 480px) {
+/* 移动端 / 窄屏自适应：不写死宽度 */
+@media (max-width: 500px) {
   .cowrite-toolbar {
-    gap: 4px;
+    padding: 8px;
+    gap: 6px;
   }
-  .cowrite-toolbar button,
-  .cowrite-btn-small {
-    flex: 1 1 auto;
-    padding: 6px 8px;
+  .cowrite-action-btn {
+    padding: 8px 10px;
+    font-size: 13px;
   }
 }
