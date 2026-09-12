@@ -2,6 +2,7 @@ import {
   App,
   ButtonComponent,
   ItemView,
+  MarkdownView,
   Modal,
   Notice,
   Plugin,
@@ -9,18 +10,25 @@ import {
   Setting,
   WorkspaceLeaf,
 } from 'obsidian';
-import { CowriteSettings, DEFAULT_SETTINGS, normalizeSettings } from './settings';
-import { testConnection } from './llm';
-import { getSelection, getFullText, replaceSelection, replaceFullText } from './editorContext';
-import { rewrite, rewriteLabel, RewriteMode } from './rewrite';
-import { generateImages } from './imageGen';
-import { formatMarkdown } from './formatMd';
 import {
+  CowriteSettings,
+  DEFAULT_SETTINGS,
+  IMAGE_SIZE_MAP,
+  ImageSizePreset,
+  normalizeSettings,
+  resolveImageSize,
+} from './settings';
+import { parseError, testConnection } from './llm';
+import { getSelection, getFullText, replaceFullText } from './editorContext';
+import { rewrite, rewriteLabel, RewriteMode } from './rewrite';
+import { buildImagePrompt, generateImages } from './imageGen';
+import { formatMarkdown, markdownToWechatHtml, smartFormatWithLLM } from './formatMd';
+import {
+  isWechatConfigured,
   PUBLISH_PLATFORMS,
   PLATFORM_LABEL,
   PublishPlatform,
-  getConfiguredToken,
-  publish,
+  publishWechatDraft,
 } from './publish';
 
 export const VIEW_TYPE_COWRITE = 'cowrite-ai-toolbar';
@@ -122,24 +130,32 @@ class CowriteToolbarView extends ItemView {
     const btnPublish = this.makeButton(contentEl, '📤', '文章发布');
 
     btnRewrite.onClick(async () => {
-      await withBusy(btnRewrite, '✏️', async () => {
-        await this.handleRewrite();
-      });
+      try {
+        await this.handleRewrite(btnRewrite);
+      } catch (e) {
+        new Notice(`改写失败：${parseError(e)}`, 8000);
+      }
     });
     btnImage.onClick(async () => {
-      await withBusy(btnImage, '🖼️', async () => {
-        await this.handleImage();
-      });
+      try {
+        await this.handleImage(btnImage);
+      } catch (e) {
+        new Notice(`配图失败：${parseError(e)}`, 8000);
+      }
     });
     btnFormat.onClick(async () => {
-      await withBusy(btnFormat, '📐', async () => {
-        await this.handleFormat();
-      });
+      try {
+        await this.handleFormat(btnFormat);
+      } catch (e) {
+        new Notice(`排版失败：${parseError(e)}`, 8000);
+      }
     });
     btnPublish.onClick(async () => {
-      await withBusy(btnPublish, '📤', async () => {
-        await this.handlePublish();
-      });
+      try {
+        await this.handlePublish(btnPublish);
+      } catch (e) {
+        new Notice(`发布失败：${parseError(e)}`, 8000);
+      }
     });
   }
 
@@ -154,8 +170,8 @@ class CowriteToolbarView extends ItemView {
     return btn;
   }
 
-  // ---- 按钮 1：文章改写 ----
-  private async handleRewrite(): Promise<void> {
+  // ---- 按钮 1：文章改写（SSE 流式逐字替换） ----
+  private async handleRewrite(btn: ButtonComponent): Promise<void> {
     const sel = getSelection(this.app);
     const ctx = await getFullText(this.app);
     if (!ctx) {
@@ -166,24 +182,55 @@ class CowriteToolbarView extends ItemView {
     if (!picked) return;
     const { mode, targetLang } = picked;
 
-    const source = sel ? sel : ctx.content;
-    const out = await rewrite(mode, source, targetLang, this.plugin.settings);
+    const source = sel && sel.length > 0 ? sel : ctx.content;
+    const actionName = rewriteLabel(mode);
 
-    if (sel) {
-      replaceSelection(this.app, out);
-    } else {
-      await replaceFullText(this.app, ctx.file, out);
-    }
+    btn.setDisabled(true);
+    const original = btn.buttonEl.textContent ?? '';
+    btn.setButtonText(`正在${actionName}...`);
+    btn.buttonEl.addClass('cowrite-busy');
+    try {
+      // 捕获编辑器替换区间
+      const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+      const editor = view?.editor;
+      let from: { line: number; ch: number } | null = null;
+      let to: { line: number; ch: number } | null = null;
+      if (editor) {
+        const hasSel = editor.getSelection().length > 0;
+        if (hasSel) {
+          from = editor.getCursor('from');
+          to = editor.getCursor('to');
+        } else {
+          from = { line: 0, ch: 0 };
+          const total = editor.getValue().length;
+          to = editor.offsetToPos(total);
+        }
+      }
 
-    if (mode === 'expand') {
-      new Notice(`已扩写至 ${out.length} 字`);
-    } else {
-      new Notice(`已完成${rewriteLabel(mode)}`);
+      let first = true;
+      await rewrite(mode, source, targetLang, this.plugin.settings, (delta, fullSoFar) => {
+        void delta;
+        const ed = this.app.workspace.getActiveViewOfType(MarkdownView)?.editor;
+        if (!ed || !from || !to) return;
+        if (first) {
+          ed.replaceRange(fullSoFar, from, to);
+          first = false;
+        } else {
+          const startOff = ed.posToOffset(from);
+          const curEnd = ed.offsetToPos(startOff + fullSoFar.length);
+          ed.replaceRange(fullSoFar, from, curEnd);
+        }
+      });
+      new Notice(`已完成${actionName}`);
+    } finally {
+      btn.buttonEl.removeClass('cowrite-busy');
+      btn.setButtonText(original);
+      btn.setDisabled(false);
     }
   }
 
-  // ---- 按钮 2：文章配图 ----
-  private async handleImage(): Promise<void> {
+  // ---- 按钮 2：文章配图（LLM 生成 prompt，逐张生成） ----
+  private async handleImage(btn: ButtonComponent): Promise<void> {
     const ctx = await getFullText(this.app);
     if (!ctx) {
       new Notice('请先打开一篇笔记');
@@ -192,118 +239,190 @@ class CowriteToolbarView extends ItemView {
     const pos = await openImageModal(this.app);
     if (!pos) return;
 
-    // 从正文提取提示词（前 200 字，粗略去掉 markdown 符号）
-    const promptRaw = ctx.content.replace(/[#>*`\[\]()!\-_]/g, ' ').replace(/\s+/g, ' ').trim();
-    const prompt = promptRaw.slice(0, 200) || ctx.file.basename;
+    btn.setDisabled(true);
+    const original = btn.buttonEl.textContent ?? '';
+    btn.setButtonText('正在理解文章...');
+    btn.buttonEl.addClass('cowrite-busy');
+    try {
+      // 提取标题 + 开头 300 字给 LLM 生成配图 prompt
+      const titleMatch = /^#\s+(.+)$/m.exec(ctx.content);
+      const title = titleMatch ? titleMatch[1].trim() : ctx.file.basename;
+      const plainHead = ctx.content
+        .replace(/[#>*`\[\]()!\-_]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      const prompt = await buildImagePrompt(title, plainHead, this.plugin.settings);
 
-    // 决定生成几张
-    let count = 1;
-    if (pos === 'between') {
-      const blocks = ctx.content.split(/\n\s*\n/).filter((b) => b.trim().length > 0);
-      count = Math.max(1, Math.min(3, blocks.length - 1));
-    }
+      // 尺寸：所有位置默认走设置里的预设（默认 16:9 横版）
+      const size = resolveImageSize(this.plugin.settings.imageSizePreset);
 
-    const buffers = await generateImages(prompt, count, this.plugin.settings);
+      // 决定生成几张
+      let count = 1;
+      if (pos === 'between') {
+        const blocks = ctx.content.split(/\n\s*\n/).filter((b) => b.trim().length > 0);
+        count = Math.max(1, Math.min(3, blocks.length - 1));
+      }
 
-    // 写回 vault/attachments/
-    const dir = this.plugin.settings.attachmentsDir;
-    const adapter = this.app.vault.adapter;
-    if (!(await adapter.exists(dir))) {
-      await adapter.mkdir(dir).catch(() => undefined);
-    }
-    const names: string[] = [];
-    for (let i = 0; i < buffers.length; i++) {
-      const fname = `cowrite-${Date.now()}-${i}.png`;
-      const fpath = `${dir}/${fname}`;
-      await this.app.vault.createBinary(fpath, buffers[i]);
-      names.push(fpath);
-    }
+      // 逐张生成
+      const dir = this.plugin.settings.attachmentsDir;
+      const adapter = this.app.vault.adapter;
+      if (!(await adapter.exists(dir))) {
+        await adapter.mkdir(dir).catch(() => undefined);
+      }
+      const ts = Date.now();
+      const names: string[] = [];
+      for (let i = 0; i < count; i++) {
+        btn.setButtonText(`正在生成配图 ${i + 1}/${count}...`);
+        const buffers = await generateImages(prompt, 1, this.plugin.settings, size);
+        const fname = `cowrite-${ts}-${i}.png`;
+        const fpath = `${dir}/${fname}`;
+        await this.app.vault.createBinary(fpath, buffers[0]);
+        names.push(fpath);
+      }
 
-    // 插入 Markdown 图片语法
-    let md = ctx.content;
-    const imgTags = names.map((n) => `![image](${n})`);
-    if (pos === 'start') {
-      md = `${imgTags.join('\n\n')}\n\n${md}`;
-    } else if (pos === 'end') {
-      md = `${md.replace(/\s+$/, '')}\n\n${imgTags.join('\n')}\n`;
-    } else {
-      // between：在段落块之间依次插入
-      const parts = md.split(/(\n\s*\n)/);
-      // 只在非空块之间插入
-      const blocks: string[] = [];
-      let sep = '';
-      for (let i = 0; i < parts.length; i++) {
-        if (/^\s*$/.test(parts[i])) {
-          sep = parts[i];
-        } else {
-          blocks.push(parts[i]);
+      // 插入 Markdown 图片语法
+      let md = ctx.content;
+      const imgTags = names.map((n) => `![](${n})`);
+      if (pos === 'start') {
+        md = `${imgTags.join('\n\n')}\n\n${md}`;
+      } else if (pos === 'end') {
+        md = `${md.replace(/\s+$/, '')}\n\n${imgTags.join('\n')}\n`;
+      } else {
+        const parts = md.split(/(\n\s*\n)/);
+        const blocks: string[] = [];
+        for (let i = 0; i < parts.length; i++) {
+          if (!/^\s*$/.test(parts[i])) blocks.push(parts[i]);
         }
+        let result = blocks[0] ?? '';
+        for (let i = 1; i < blocks.length; i++) {
+          const tag = imgTags[Math.min(i - 1, imgTags.length - 1)] ?? imgTags[0];
+          result += `\n\n${tag}\n\n` + blocks[i];
+        }
+        md = result + '\n';
       }
-      let result = blocks[0] ?? '';
-      for (let i = 1; i < blocks.length; i++) {
-        const tag = imgTags[Math.min(i - 1, imgTags.length - 1)] ?? imgTags[0];
-        result += `\n\n${tag}\n\n` + blocks[i];
-      }
-      md = result + '\n';
-    }
 
-    await replaceFullText(this.app, ctx.file, md);
-    new Notice(`已插入 ${names.length} 张配图`);
+      await replaceFullText(this.app, ctx.file, md);
+      new Notice(`已插入 ${names.length} 张配图`);
+    } finally {
+      btn.buttonEl.removeClass('cowrite-busy');
+      btn.setButtonText(original);
+      btn.setDisabled(false);
+    }
   }
 
-  // ---- 按钮 3：文章排版 ----
-  private async handleFormat(): Promise<void> {
+  // ---- 按钮 3：文章排版（纯正则 / LLM 智能排版 + 公众号 HTML 复制） ----
+  private async handleFormat(btn: ButtonComponent): Promise<void> {
     const ctx = await getFullText(this.app);
     if (!ctx) {
       new Notice('请先打开一篇笔记');
       return;
     }
-    const formatted = formatMarkdown(ctx.content);
-    if (formatted !== ctx.content) {
-      await replaceFullText(this.app, ctx.file, formatted);
+    const useSmart = await openFormatModal(this.app);
+    if (useSmart === null) return;
+
+    btn.setDisabled(true);
+    const original = btn.buttonEl.textContent ?? '';
+    btn.setButtonText(useSmart ? '正在智能排版...' : '正在排版...');
+    btn.buttonEl.addClass('cowrite-busy');
+    try {
+      let formatted: string;
+      if (useSmart) {
+        const llmOut = await smartFormatWithLLM(ctx.content, this.plugin.settings);
+        formatted = formatMarkdown(llmOut);
+      } else {
+        formatted = formatMarkdown(ctx.content);
+      }
+      if (formatted !== ctx.content) {
+        await replaceFullText(this.app, ctx.file, formatted);
+      }
+      // 排版完成：toast 带"复制为公众号 HTML"按钮
+      showFormatDoneNotice(formatted);
+    } finally {
+      btn.buttonEl.removeClass('cowrite-busy');
+      btn.setButtonText(original);
+      btn.setDisabled(false);
     }
-    new Notice('已排版');
   }
 
   // ---- 按钮 4：文章发布 ----
-  private async handlePublish(): Promise<void> {
+  private async handlePublish(btn: ButtonComponent): Promise<void> {
     const ctx = await getFullText(this.app);
     if (!ctx) {
       new Notice('请先打开一篇笔记');
       return;
     }
-    const platform = await openPublishModal(this.app, this.plugin.settings);
-    if (!platform) return;
+    const choice = await openPublishModal(this.app, this.plugin.settings, ctx.content);
+    if (!choice) return;
+
+    btn.setDisabled(true);
+    const original = btn.buttonEl.textContent ?? '';
+    btn.setButtonText('正在发布...');
+    btn.buttonEl.addClass('cowrite-busy');
     try {
-      const r = await publish(platform, ctx.content, this.plugin.settings);
-      new Notice(r.message);
-    } catch (e) {
-      new Notice(`发布失败：${(e as Error).message || String(e)}`);
+      if (choice.platform === 'wechat') {
+        // 提取封面图（如果用户选了文章第一张图）
+        let cover: ArrayBuffer | undefined;
+        if (choice.coverFromFirstImage) {
+          const firstImg = extractFirstImage(ctx.content);
+          if (firstImg) {
+            try {
+              cover = await this.app.vault.adapter.readBinary(firstImg);
+            } catch {
+              new Notice('封面图读取失败，将不使用封面', 4000);
+              cover = undefined;
+            }
+          }
+        }
+        const html = markdownToWechatHtml(ctx.content);
+        const r = await publishWechatDraft(this.plugin.settings, {
+          title: choice.title,
+          author: choice.author,
+          digest: choice.digest,
+          htmlContent: html,
+          coverImage: cover,
+          coverFilename: 'cover.png',
+        });
+        new Notice(r.message, 10000);
+      } else {
+        throw new Error(`${PLATFORM_LABEL[choice.platform]}发布功能开发中，暂不支持`);
+      }
+    } finally {
+      btn.buttonEl.removeClass('cowrite-busy');
+      btn.setButtonText(original);
+      btn.setDisabled(false);
     }
   }
 }
 
-/** 按钮 loading 包装：置灰 + “处理中...”，结束后恢复 */
-async function withBusy(
-  btn: ButtonComponent,
-  restoreText: string,
-  fn: () => Promise<void>,
-): Promise<void> {
-  btn.setDisabled(true);
-  const original = btn.buttonEl.textContent ?? restoreText;
-  btn.setButtonText('处理中...');
-  btn.buttonEl.addClass('cowrite-busy');
-  try {
-    await fn();
-  } finally {
-    btn.buttonEl.removeClass('cowrite-busy');
-    btn.setButtonText(original);
-    btn.setDisabled(false);
-  }
+/** 从 Markdown 里提取第一张图片的 vault 相对路径 */
+function extractFirstImage(md: string): string | null {
+  const m = /!\[[^\]]*\]\(([^)\s]+)(?:\s+"[^"]*")?\)/.exec(md);
+  return m ? m[1] : null;
+}
+
+/** 排版完成 toast：带"复制为公众号 HTML"按钮 */
+function showFormatDoneNotice(formattedMd: string): void {
+  const notice = new Notice('', 8000);
+  notice.noticeEl.addClass('cowrite-format-notice');
+  const textEl = notice.noticeEl.createEl('div', { text: '已排版' });
+  textEl.style.marginBottom = '8px';
+  const btn = notice.noticeEl.createEl('button', { text: '复制为公众号 HTML' });
+  btn.addClass('mod-cta');
+  btn.style.width = '100%';
+  btn.addEventListener('click', async () => {
+    try {
+      const html = markdownToWechatHtml(formattedMd);
+      await navigator.clipboard.writeText(html);
+      new Notice('已复制公众号 HTML');
+      notice.hide();
+    } catch (e) {
+      new Notice(`复制失败：${parseError(e)}`, 6000);
+    }
+  });
 }
 
 // ---------------------------------------------------------------------------
-// Modal：文章改写
+// Modal：文章改写（5 个模式）
 // ---------------------------------------------------------------------------
 
 interface RewriteChoice {
@@ -326,7 +445,7 @@ function openRewriteModal(app: App): Promise<RewriteChoice | null> {
     langInput.style.display = 'none';
 
     const modeSel = modal.contentEl.createEl('select', { cls: 'cowrite-input' });
-    (['polish', 'expand', 'shorten', 'translate'] as RewriteMode[]).forEach((m) => {
+    (['polish', 'expand', 'shorten', 'translate', 'deai'] as RewriteMode[]).forEach((m) => {
       const opt = modeSel.createEl('option', { text: rewriteLabel(m), value: m });
       opt.value = m;
     });
@@ -357,7 +476,7 @@ function openRewriteModal(app: App): Promise<RewriteChoice | null> {
 }
 
 // ---------------------------------------------------------------------------
-// Modal：文章配图
+// Modal：文章配图（只选位置，尺寸自动带 16:9）
 // ---------------------------------------------------------------------------
 
 type ImagePos = 'start' | 'between' | 'end';
@@ -369,13 +488,18 @@ function openImageModal(app: App): Promise<ImagePos | null> {
     modal.titleEl.setText('文章配图');
     const sel = modal.contentEl.createEl('select', { cls: 'cowrite-input' });
     [
-      { v: 'start', t: '开头' },
-      { v: 'between', t: '每段之间' },
+      { v: 'start', t: '开头（封面）' },
+      { v: 'between', t: '每段之间（最多 3 张）' },
       { v: 'end', t: '结尾' },
     ].forEach((o) => {
       const opt = sel.createEl('option', { text: o.t, value: o.v });
       opt.value = o.v;
     });
+    const hint = modal.contentEl.createEl('p', {
+      cls: 'cowrite-desc',
+      text: '尺寸自动按设置中的配图预设（默认 16:9 横版），无需手动选择。',
+    });
+    void hint;
     const btns = modal.contentEl.createDiv({ cls: 'cowrite-modal-btns' });
     const ok = btns.createEl('button', { text: '生成' });
     ok.addClass('mod-cta');
@@ -394,13 +518,57 @@ function openImageModal(app: App): Promise<ImagePos | null> {
 }
 
 // ---------------------------------------------------------------------------
-// Modal：文章发布
+// Modal：文章排版（智能排版开关）
 // ---------------------------------------------------------------------------
 
-function openPublishModal(app: App, settings: CowriteSettings): Promise<PublishPlatform | null> {
+/** 返回 null 表示取消；返回 boolean 表示是否启用智能排版 */
+function openFormatModal(app: App): Promise<boolean | null> {
   return new Promise((resolve) => {
     let done = false;
-    let platform: PublishPlatform = PUBLISH_PLATFORMS[0];
+    const modal = new Modal(app);
+    modal.titleEl.setText('文章排版');
+
+    const label = modal.contentEl.createEl('label', { cls: 'cowrite-row' });
+    const toggle = label.createEl('input', { type: 'checkbox' });
+    label.createEl('span', { text: '智能排版（调 LLM：长段拆分 / 关键词高亮 / 章节编号）' });
+
+    const btns = modal.contentEl.createDiv({ cls: 'cowrite-modal-btns' });
+    const ok = btns.createEl('button', { text: '开始排版' });
+    ok.addClass('mod-cta');
+    const cancel = btns.createEl('button', { text: '取消' });
+    const finish = (v: boolean | null) => {
+      if (done) return;
+      done = true;
+      modal.close();
+      resolve(v);
+    };
+    ok.addEventListener('click', () => finish(toggle.checked));
+    cancel.addEventListener('click', () => finish(null));
+    modal.onClose = () => finish(null);
+    modal.open();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Modal：文章发布（公众号真实表单）
+// ---------------------------------------------------------------------------
+
+interface PublishChoice {
+  platform: PublishPlatform;
+  title: string;
+  author: string;
+  digest: string;
+  coverFromFirstImage: boolean;
+}
+
+function openPublishModal(
+  app: App,
+  settings: CowriteSettings,
+  md: string,
+): Promise<PublishChoice | null> {
+  return new Promise((resolve) => {
+    let done = false;
+    let platform: PublishPlatform = 'wechat';
     const modal = new Modal(app);
     modal.titleEl.setText('文章发布');
 
@@ -410,35 +578,100 @@ function openPublishModal(app: App, settings: CowriteSettings): Promise<PublishP
       opt.value = p;
     });
 
-    const tokenWrap = modal.contentEl.createDiv();
-    const renderTokenHint = () => {
-      tokenWrap.empty();
-      const configured = getConfiguredToken(settings, platform);
-      const note = tokenWrap.createEl('div', {
-        cls: 'cowrite-desc',
-        text: configured ? `已配置 ${PLATFORM_LABEL[platform]} token（可在设置中修改）` : `尚未配置 ${PLATFORM_LABEL[platform]} token`,
-      });
-      void note;
-    };
-    sel.addEventListener('change', () => {
-      platform = (sel.value as PublishPlatform) || PUBLISH_PLATFORMS[0];
-      renderTokenHint();
-    });
-    renderTokenHint();
+    const statusEl = modal.contentEl.createEl('div', { cls: 'cowrite-desc' });
+    const formWrap = modal.contentEl.createDiv();
 
-    const btns = modal.contentEl.createDiv({ cls: 'cowrite-modal-btns' });
-    const ok = btns.createEl('button', { text: '下一步' });
-    ok.addClass('mod-cta');
-    const cancel = btns.createEl('button', { text: '取消' });
-    const finish = (v: PublishPlatform | null) => {
+    // 预填标题：取第一个一级/二级标题
+    const titleMatch = /^#{1,2}\s+(.+)$/m.exec(md);
+    const defaultTitle = titleMatch ? titleMatch[1].trim() : '';
+
+    const hasFirstImage = Boolean(extractFirstImage(md));
+
+    const render = () => {
+      formWrap.empty();
+      statusEl.empty();
+
+      if (platform === 'wechat') {
+        btnsWrap.ok.disabled = false;
+        const configured = isWechatConfigured(settings);
+        statusEl.setText(
+          configured
+            ? '已配置公众号 appid / appsecret'
+            : '未配置公众号 appid / appsecret（请到设置页填写）',
+        );
+        statusEl.style.color = configured ? 'inherit' : 'var(--text-error)';
+
+        formWrap.createEl('label', { text: '标题' }).addClass('cowrite-desc');
+        const titleInput = formWrap.createEl('input', {
+          type: 'text',
+          cls: 'cowrite-input',
+          value: defaultTitle,
+          placeholder: '文章标题',
+        });
+
+        formWrap.createEl('label', { text: '作者' }).addClass('cowrite-desc');
+        const authorInput = formWrap.createEl('input', {
+          type: 'text',
+          cls: 'cowrite-input',
+          placeholder: '作者署名',
+        });
+
+        formWrap.createEl('label', { text: '摘要' }).addClass('cowrite-desc');
+        const digestInput = formWrap.createEl('textarea', {
+          cls: 'cowrite-input',
+          attr: { rows: '3', placeholder: '一句话摘要（可不填）' },
+        });
+
+        formWrap.createEl('label', { text: '封面图' }).addClass('cowrite-desc');
+        const coverSel = formWrap.createEl('select', { cls: 'cowrite-input' });
+        const optNone = coverSel.createEl('option', { text: '不使用封面', value: 'none' });
+        void optNone;
+        const optFirst = coverSel.createEl('option', {
+          text: hasFirstImage ? '使用文章第一张图' : '使用文章第一张图（文章中未检测到图片）',
+          value: 'first',
+        });
+        if (!hasFirstImage) optFirst.disabled = true;
+
+        btnsWrap.ok.onclick = () => {
+          finish({
+            platform,
+            title: titleInput.value.trim(),
+            author: authorInput.value.trim(),
+            digest: digestInput.value.trim(),
+            coverFromFirstImage: coverSel.value === 'first',
+          });
+        };
+      } else {
+        statusEl.setText(`${PLATFORM_LABEL[platform]}：开放发布 API 暂不支持，功能开发中。`);
+        statusEl.style.color = 'var(--text-warning)';
+        btnsWrap.ok.disabled = true;
+        btnsWrap.ok.onclick = () => finish(null);
+      }
+    };
+
+    const btnsWrap = (() => {
+      const btns = modal.contentEl.createDiv({ cls: 'cowrite-modal-btns' });
+      const ok = btns.createEl('button', { text: '发布到草稿箱' });
+      ok.addClass('mod-cta');
+      const cancel = btns.createEl('button', { text: '取消' });
+      cancel.addEventListener('click', () => finish(null));
+      return { ok, cancel };
+    })();
+
+    sel.addEventListener('change', () => {
+      platform = (sel.value as PublishPlatform) || 'wechat';
+      render();
+    });
+
+    const finish = (v: PublishChoice | null) => {
       if (done) return;
       done = true;
       modal.close();
       resolve(v);
     };
-    ok.addEventListener('click', () => finish(platform));
-    cancel.addEventListener('click', () => finish(null));
     modal.onClose = () => finish(null);
+
+    render();
     modal.open();
   });
 }
@@ -560,37 +793,58 @@ class CowriteSettingTab extends PluginSettingTab {
           }),
       );
     new Setting(containerEl)
-      .setName('Image Size')
-      .setDesc('例如 1024x1024 / 1792x1024')
-      .addText((t) =>
-        t.setPlaceholder('1024x1024')
-          .setValue(this.plugin.settings.imageSize)
+      .setName('配图尺寸')
+      .setDesc('所有配图位置默认使用此尺寸；16:9 为横版封面/正文图规格')
+      .addDropdown((d) =>
+        d.addOptions({
+          '1:1': `1:1 (${IMAGE_SIZE_MAP['1:1']})`,
+          '16:9': `16:9 (${IMAGE_SIZE_MAP['16:9']})`,
+          '9:16': `9:16 (${IMAGE_SIZE_MAP['9:16']})`,
+        })
+          .setValue(this.plugin.settings.imageSizePreset)
           .onChange(async (v) => {
-            this.plugin.settings.imageSize = v.trim() || DEFAULT_SETTINGS.imageSize;
+            this.plugin.settings.imageSizePreset = (v as ImageSizePreset) || '16:9';
             await this.plugin.saveSettings();
           }),
       );
 
-    // ---- 发布平台配置（预留 UI） ----
-    containerEl.createEl('h3', { text: '发布平台配置（预留）' });
-    const tokenFields: Array<{ name: string; key: 'wechatToken' | 'zhihuToken' | 'xiaohongshuToken' | 'juejinToken' }> = [
-      { name: '公众号 token', key: 'wechatToken' },
-      { name: '知乎 token', key: 'zhihuToken' },
-      { name: '小红书 token', key: 'xiaohongshuToken' },
-      { name: '掘金 token', key: 'juejinToken' },
-    ];
-    for (const f of tokenFields) {
+    // ---- 公众号发布配置 ----
+    containerEl.createEl('h3', { text: '公众号发布配置' });
+    new Setting(containerEl)
+      .setName('公众号 AppID')
+      .setDesc('在微信公众平台 → 开发 → 基本配置中获取')
+      .addText((t) =>
+        t.setPlaceholder('wx...')
+          .setValue(this.plugin.settings.wechatAppid)
+          .onChange(async (v) => {
+            this.plugin.settings.wechatAppid = v.trim();
+            await this.plugin.saveSettings();
+          }),
+      );
+    new Setting(containerEl)
+      .setName('公众号 AppSecret')
+      .setDesc('仅保存在本地 data.json')
+      .addText((t) =>
+        t.setPlaceholder('AppSecret')
+          .setValue(this.plugin.settings.wechatSecret)
+          .onChange(async (v) => {
+            this.plugin.settings.wechatSecret = v.trim();
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    containerEl.createEl('h3', { text: '其他平台（开发中）' });
+    for (const [name, desc] of [
+      ['知乎', '无开放发布 API，暂不支持'],
+      ['小红书', '无开放发布 API，暂不支持'],
+      ['掘金', '无开放发布 API，暂不支持'],
+    ] as Array<[string, string]>) {
       new Setting(containerEl)
-        .setName(f.name)
-        .setDesc('发布 API 尚未接入，先预留配置位')
-        .addText((t) =>
-          t.setPlaceholder('token / cookie')
-            .setValue(this.plugin.settings[f.key])
-            .onChange(async (v) => {
-              this.plugin.settings[f.key] = v.trim();
-              await this.plugin.saveSettings();
-            }),
-        );
+        .setName(name)
+        .setDesc(desc)
+        .addText((t) => {
+          t.setPlaceholder('开发中').setDisabled(true);
+        });
     }
 
     // ---- 其他 ----
@@ -618,7 +872,7 @@ class CowriteSettingTab extends PluginSettingTab {
 
     containerEl.createEl('p', {
       cls: 'cowrite-desc',
-      text: '所有处理均在本地完成，API Key 仅保存在插件 data.json。',
+      text: '所有处理均在本地完成，API Key / AppSecret 仅保存在插件 data.json。',
     });
   }
 }

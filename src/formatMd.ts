@@ -1,8 +1,19 @@
+import type { CowriteSettings } from './settings';
+import { chatComplete } from './llm';
+
 /**
- * Markdown 排版：纯规则化处理（正则 + 字符串），不调 LLM。
- * 处理：标题层级不跳级、列表缩进统一、引用块前后空行、加粗内空格规范、段落间空行、代码块前后空行。
- *  fenced 代码块内容原样保留，不参与改写。
+ * Markdown 排版：
+ *  - formatMarkdown：纯规则化（正则 + 字符串），不调 LLM。
+ *    保留原有规则 + 新增全角标点转换（跳过代码块）+ 超长段拆分。
+ *  - smartFormatWithLLM：可选的 LLM 辅助排版（长段拆分 / 关键词高亮 / 章节编号）。
+ *  - markdownToWechatHtml：把 Markdown 转成公众号可用的内联样式 HTML。
+ *
+ * fenced 代码块内容原样保留，不参与改写。
  */
+
+// ---------------------------------------------------------------------------
+// 原有纯正则规则（保留）
+// ---------------------------------------------------------------------------
 
 interface Line {
   raw: string;
@@ -43,7 +54,6 @@ function normalizeList(line: string): string {
   const m = /^(\s*)([-*+]|\d+\.)(\s+)(.*)$/.exec(line);
   if (!m) return line.replace(/\s+$/, '');
   const indent = m[1].replace(/\t/g, '  ');
-  // 缩进统一按 2 的倍数
   const spaces = indent.length;
   const rounded = Math.round(spaces / 2) * 2;
   return `${' '.repeat(rounded)}${m[2]} ${m[4].replace(/\s+$/, '')}`;
@@ -57,7 +67,7 @@ function normalizeHeadings(lines: Line[]): void {
   }
   if (levels.length === 0) return;
   const base = Math.min(...levels);
-  const shift = base - 1; // 让最小级变成 1
+  const shift = base - 1;
   let prev = 0;
   for (const ln of lines) {
     if (ln.type !== 'heading') continue;
@@ -70,13 +80,112 @@ function normalizeHeadings(lines: Line[]): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 新增：全角标点转换（跳过代码块 / 行内代码 / 链接 URL）
+// ---------------------------------------------------------------------------
+
+const CJK = '\u4e00-\u9fff';
+
+/**
+ * 把正文里的半角逗号/句号转成全角。
+ * 仅当中文相邻时转换，避免破坏 URL、数字小数、代码。
+ * 代码块 fence 内整体跳过。
+ */
+function convertFullWidthPunct(text: string): string {
+  return text
+    // 半角逗号：前后至少一侧是中文 → 全角逗号
+    .replace(new RegExp(`(?<=[${CJK}])\\s*,\\s*(?=[${CJK}])`, 'g'), '，')
+    // 半角句号：前面是中文、后面是中文/空白/行尾 → 全角句号
+    .replace(new RegExp(`(?<=[${CJK}])\\.(?=[\\s${CJK}]|$)`, 'g'), '。');
+}
+
+/** 按行处理，跳过 fenced code block 内部 */
+function applyFullWidthOutsideCode(md: string): string {
+  const lines = md.split('\n');
+  let inCode = false;
+  const out: string[] = [];
+  for (const line of lines) {
+    if (/^\s*(```|~~~)/.test(line)) {
+      inCode = !inCode;
+      out.push(line);
+      continue;
+    }
+    if (inCode) {
+      out.push(line);
+      continue;
+    }
+    out.push(convertFullWidthPunct(line));
+  }
+  return out.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// 新增：超长段落拆分（>150 字在中间最近的句号/分号处拆两段）
+// ---------------------------------------------------------------------------
+
+function splitLongParagraphs(md: string, maxLen = 150): string {
+  // 按空行切块
+  const blocks = md.split(/(\n\s*\n)/);
+  const out: string[] = [];
+  for (const block of blocks) {
+    // 分隔符原样保留
+    if (/^\s*$/.test(block)) {
+      out.push(block);
+      continue;
+    }
+    // 跳过代码块 / 标题 / 列表 / 引用
+    const trimmed = block.trim();
+    if (
+      /^(```|~~~|#{1,6}\s|>|\s*[-*+]\s|\s*\d+\.\s)/m.test(trimmed)
+    ) {
+      out.push(block);
+      continue;
+    }
+    // 去除 markdown 标记后纯文本长度
+    const plainLen = trimmed.replace(/[#*>`\[\]()!_-]/g, '').length;
+    if (plainLen <= maxLen) {
+      out.push(block);
+      continue;
+    }
+    // 找中间附近的句号/分号
+    const mid = Math.floor(block.length / 2);
+    let best = -1;
+    for (let i = mid; i < block.length; i++) {
+      const ch = block[i];
+      if (ch === '。' || ch === '；' || ch === ';' || ch === '！' || ch === '!') {
+        best = i + 1;
+        break;
+      }
+    }
+    if (best < 0) {
+      for (let i = mid; i >= 0; i--) {
+        const ch = block[i];
+        if (ch === '。' || ch === '；' || ch === ';' || ch === '！' || ch === '!') {
+          best = i + 1;
+          break;
+        }
+      }
+    }
+    if (best <= 0 || best >= block.length - 1) {
+      out.push(block);
+      continue;
+    }
+    const left = block.slice(0, best).trimEnd();
+    const right = block.slice(best).trimStart();
+    out.push(`${left}\n\n${right}`);
+  }
+  return out.join('');
+}
+
+// ---------------------------------------------------------------------------
+// 对外主入口：纯正则排版
+// ---------------------------------------------------------------------------
+
 export function formatMarkdown(md: string): string {
   if (!md) return md;
-  // 统一换行
   const normalized = md.replace(/\r\n?/g, '\n');
   const srcLines = normalized.split('\n');
 
-  // 1) 逐行分类（跟踪代码块）
   let inCode = false;
   const lines: Line[] = [];
   for (const raw of srcLines) {
@@ -86,7 +195,6 @@ export function formatMarkdown(md: string): string {
     if (isFence) inCode = !inCode;
   }
 
-  // 2) 行级规整（代码块内部不动）
   for (const ln of lines) {
     if (ln.inCode) {
       ln.raw = ln.raw.replace(/\s+$/, '');
@@ -101,10 +209,8 @@ export function formatMarkdown(md: string): string {
     }
   }
 
-  // 3) 标题层级
   normalizeHeadings(lines);
 
-  // 4) 插入必要空行：引用块、代码块前后
   const out: Line[] = [];
   const needBlankBefore = (i: number): boolean => {
     const cur = lines[i];
@@ -132,9 +238,6 @@ export function formatMarkdown(md: string): string {
     if (needBlankAfter(i)) out.push({ raw: '', isCodeFence: false, inCode: false, type: 'blank' });
   }
 
-  // 5) 段落间空行：把连续的 paragraph 行合并为块，块之间保证一个空行
-  //    （标题/列表/引用/代码块天然分隔；这里只处理连续 paragraph 之间的多余压缩）
-  // 6) 折叠连续空行（>1 个空行压成 1 个），并去掉首尾空行
   const folded: string[] = [];
   let blankRun = 0;
   for (const ln of out) {
@@ -149,5 +252,157 @@ export function formatMarkdown(md: string): string {
   while (folded.length && folded[0] === '') folded.shift();
   while (folded.length && folded[folded.length - 1] === '') folded.pop();
 
-  return folded.join('\n') + '\n';
+  let result = folded.join('\n') + '\n';
+  // 新增：全角标点 + 长段拆分
+  result = applyFullWidthOutsideCode(result);
+  result = splitLongParagraphs(result, 150);
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// LLM 辅助智能排版
+// ---------------------------------------------------------------------------
+
+/**
+ * 调 LLM 做智能排版：
+ *  - 长段拆分（≤150 字/段）
+ *  - 关键词高亮（每段 1-3 个核心短语用 ==高亮==）
+ *  - 二级标题 ## 自动加 01/02/03 前缀
+ */
+export async function smartFormatWithLLM(md: string, settings: CowriteSettings): Promise<string> {
+  const system =
+    '你是一名中文 Markdown 排版编辑。用户会给你一段 Markdown 正文。请直接输出排版后的完整 Markdown（不要解释、不要代码块包裹）。' +
+    '要求：' +
+    '1) 把超过 150 字的段落拆成多段，每段不超过 150 字；' +
+    '2) 每段挑选 1-3 个核心短语，用 ==高亮== 包裹（Obsidian 高亮语法）；' +
+    '3) 二级标题（## 开头）自动加两位序号前缀，例如 "## 01 引言"、"## 02 正文"；' +
+    '4) 代码块、图片语法、链接 URL 原样保留，不要改动；' +
+    '5) 不要删除原文内容，不要新增段落，只做排版加工。';
+  return await chatComplete(
+    settings,
+    [
+      { role: 'system', content: system },
+      { role: 'user' as const, content: md },
+    ],
+    { temperature: 0.3, maxTokens: settings.maxTokens },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Markdown → 公众号内联样式 HTML
+// ---------------------------------------------------------------------------
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/** 处理行内样式：图片、链接、加粗、斜体、行内代码、高亮 */
+function inlineHtml(text: string): string {
+  let s = escapeHtml(text);
+  // 图片 ![alt](src)
+  s = s.replace(
+    /!\[([^\]]*)\]\(([^)]+)\)/g,
+    `<img src="$2" alt="$1" style="max-width: 100%; height: auto; display: block; margin: 1em auto;" />`,
+  );
+  // 链接 [text](url)
+  s = s.replace(
+    /\[([^\]]+)\]\(([^)]+)\)/g,
+    `<a href="$2" style="color: #576b95; text-decoration: none;">$1</a>`,
+  );
+  // 高亮 ==text==
+  s = s.replace(/==([^=\n]+)==/g, `<mark style="background: #fff3a3; padding: 0 2px;">$1</mark>`);
+  // 加粗 **text**
+  s = s.replace(/\*\*([^*\n]+)\*\*/g, `<strong style="font-weight: 600;">$1</strong>`);
+  // 斜体 *text*
+  s = s.replace(/(^|[^*])\*([^*\n]+)\*/g, `$1<em>$2</em>`);
+  // 行内代码 `code`
+  s = s.replace(/`([^`\n]+)`/g, `<code style="background: #f6f8fa; padding: 2px 4px; border-radius: 3px; font-size: 14px; color: #c7254e;">$1</code>`);
+  return s;
+}
+
+/**
+ * 把 Markdown 转成公众号编辑器可粘贴的 HTML：
+ * 所有样式内联，无 class/id。
+ */
+export function markdownToWechatHtml(md: string): string {
+  const lines = md.replace(/\r\n?/g, '\n').split('\n');
+  const html: string[] = [];
+  let inCode = false;
+  let listOpen = false;
+
+  const closeList = () => {
+    if (listOpen) {
+      html.push('</ul>');
+      listOpen = false;
+    }
+  };
+
+  for (const raw of lines) {
+    const line = raw;
+    if (/^\s*(```|~~~)/.test(line)) {
+      closeList();
+      inCode = !inCode;
+      if (inCode) {
+        html.push(
+          `<pre style="margin: 1em 0; padding: 12px; background: #f6f8fa; border-radius: 4px; overflow-x: auto; font-size: 14px; line-height: 1.6; color: #333;"><code>${escapeHtml(line.replace(/^\s*(```|~~~)/, ''))}\n`,
+        );
+      } else {
+        html.push('</code></pre>');
+      }
+      continue;
+    }
+    if (inCode) {
+      html.push(escapeHtml(line) + '\n');
+      continue;
+    }
+
+    const t = line.trim();
+    if (t === '') {
+      closeList();
+      continue;
+    }
+
+    // 标题
+    const h = /^(#{1,6})\s+(.*)$/.exec(t);
+    if (h) {
+      closeList();
+      const level = Math.min(6, h[1].length);
+      const fontSize = level === 1 ? 22 : level === 2 ? 20 : level === 3 ? 18 : 16;
+      html.push(
+        `<h${level} style="margin: 1.5em 0 0.5em; font-weight: 600; font-size: ${fontSize}px; color: #1f1f1f;">${inlineHtml(h[2])}</h${level}>`,
+      );
+      continue;
+    }
+
+    // 引用
+    if (/^>\s?/.test(t)) {
+      closeList();
+      const inner = t.replace(/^>\s?/, '');
+      html.push(
+        `<blockquote style="margin: 1em 0; padding: 0.5em 1em; border-left: 3px solid #ddd; color: #666; background: #fafafa;">${inlineHtml(inner)}</blockquote>`,
+      );
+      continue;
+    }
+
+    // 无序列表
+    if (/^[-*+]\s+/.test(t)) {
+      if (!listOpen) {
+        html.push('<ul style="margin: 0.5em 0; padding-left: 1.5em; color: #3f3f3f; line-height: 1.75;">');
+        listOpen = true;
+      }
+      const inner = t.replace(/^[-*+]\s+/, '');
+      html.push(`<li style="margin: 0.25em 0;">${inlineHtml(inner)}</li>`);
+      continue;
+    }
+
+    // 普通段落
+    closeList();
+    html.push(
+      `<p style="margin: 0 0 1em; line-height: 1.75; font-size: 16px; color: #3f3f3f;">${inlineHtml(t)}</p>`,
+    );
+  }
+  closeList();
+  if (inCode) html.push('</code></pre>');
+
+  return html.join('\n');
 }

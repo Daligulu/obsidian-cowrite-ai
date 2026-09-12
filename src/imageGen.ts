@@ -1,9 +1,15 @@
 import type { CowriteSettings } from './settings';
+import { chatComplete, readErrorBody } from './llm';
 
 /**
- * 图像生成：OpenAI 兼容 POST <imageApiBase>/images/generations，response_format=b64_json。
+ * 图像生成：
+ *  - buildImagePrompt：先用 LLM 根据标题+开头 300 字生成英文配图 prompt，末尾拼统一风格后缀
+ *  - generateImages：OpenAI 兼容 POST <imageApiBase>/images/generations，response_format=b64_json
  * 纯浏览器 fetch，base64 解码为 ArrayBuffer，无 Node 依赖，移动端可用。
  */
+
+/** 所有配图统一追加的风格后缀 */
+const STYLE_SUFFIX = ', clean illustration style, soft colors, professional editorial';
 
 function buildImagesUrl(apiBase: string): string {
   const base = (apiBase || '').trim().replace(/\/+$/, '');
@@ -23,11 +29,40 @@ export function base64ToArrayBuffer(b64: string): ArrayBuffer {
   return bytes.buffer;
 }
 
-/** 生成 count 张图，返回每张图的 ArrayBuffer（PNG） */
+/**
+ * 用 LLM 根据文章标题 + 开头 300 字，生成适合配图的英文 prompt。
+ * 输出风格描述 + 内容描述；末尾自动追加统一风格后缀。
+ */
+export async function buildImagePrompt(
+  title: string,
+  head: string,
+  settings: CowriteSettings,
+): Promise<string> {
+  const system =
+    'You are an editorial illustrator prompt writer. ' +
+    'Given an article title and its opening text, write a single English image-generation prompt (one sentence, <=60 words) ' +
+    'that describes a clean editorial illustration matching the article topic. ' +
+    'Do not include any text, letters, or words in the image. ' +
+    'Do not wrap in quotes, do not add explanations, output only the prompt itself.';
+  const user = `Title: ${title}\n\nOpening: ${head.slice(0, 300)}\n\nWrite the image prompt now:`;
+  const raw = await chatComplete(
+    settings,
+    [
+      { role: 'system', content: system },
+      { role: 'user', content: user },
+    ],
+    { temperature: 0.6, maxTokens: 160 },
+  );
+  const cleaned = raw.replace(/^["'“”‘’\s]+|["'“”‘’\s]+$/g, '').trim();
+  return `${cleaned}${STYLE_SUFFIX}`;
+}
+
+/** 生成 count 张图，返回每张图的 ArrayBuffer（PNG）。size 形如 "1792x1024"，不传则用设置默认。 */
 export async function generateImages(
   prompt: string,
   count: number,
   settings: CowriteSettings,
+  size?: string,
 ): Promise<ArrayBuffer[]> {
   const apiKey = (settings.imageApiKey || '').trim() || settings.apiKey;
   if (!apiKey) {
@@ -41,7 +76,7 @@ export async function generateImages(
     model: settings.imageModel,
     prompt,
     n: Math.max(1, Math.min(4, count)),
-    size: settings.imageSize || '1024x1024',
+    size: size || '1792x1024',
     response_format: 'b64_json',
   };
 
@@ -61,19 +96,18 @@ export async function generateImages(
       signal: controller.signal,
     });
   } catch (e) {
+    window.clearTimeout(timer);
     if ((e as Error).name === 'AbortError') {
       throw new Error(`配图请求超时（>${timeoutMs}ms）`);
     }
     throw new Error(`配图网络请求失败：${(e as Error).message || String(e)}`);
-  } finally {
-    window.clearTimeout(timer);
   }
 
   if (!resp.ok) {
-    const raw = await resp.text().catch(() => '');
-    const snippet = raw ? raw.slice(0, 300) : '(空响应)';
-    throw new Error(`配图 HTTP ${resp.status} ${resp.statusText}: ${snippet}`);
+    window.clearTimeout(timer);
+    throw new Error(await readErrorBody(resp));
   }
+  window.clearTimeout(timer);
 
   const data: any = await resp.json().catch(() => null);
   const items: any[] | undefined = data?.data;

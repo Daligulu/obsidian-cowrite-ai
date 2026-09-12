@@ -1,7 +1,18 @@
 /**
  * Cowrite AI 插件设置（持久化到 <vault>/.obsidian/plugins/cowrite-ai/data.json）。
- * v0.3：文章创作工具条，不再有任务队列 / 执行器 / 页面库。
+ * v0.4：文章创作工具条，流式改写 / LLM 配图 / 智能排版 / 公众号真实发布。
  */
+
+/** 配图尺寸预设：1:1 / 16:9 / 9:16 */
+export type ImageSizePreset = '1:1' | '16:9' | '9:16';
+
+/** 预设 → OpenAI images/generations 的 size 字符串 */
+export const IMAGE_SIZE_MAP: Record<ImageSizePreset, string> = {
+  '1:1': '1024x1024',
+  '16:9': '1792x1024',
+  '9:16': '1024x1792',
+};
+
 export interface CowriteSettings {
   // ---- LLM 配置 ----
   /** OpenAI 兼容 chat/completions 基础地址 */
@@ -24,14 +35,14 @@ export interface CowriteSettings {
   imageApiKey: string;
   /** 图像模型，默认 dall-e-3 */
   imageModel: string;
-  /** 图像尺寸，默认 1024x1024 */
-  imageSize: string;
+  /** 配图尺寸预设（1:1 / 16:9 / 9:16），所有位置默认走 16:9 横版 */
+  imageSizePreset: ImageSizePreset;
 
-  // ---- 发布平台配置（预留 UI，实际 API 未实现） ----
-  wechatToken: string;
-  zhihuToken: string;
-  xiaohongshuToken: string;
-  juejinToken: string;
+  // ---- 公众号发布配置（真实 API） ----
+  /** 公众号 appid */
+  wechatAppid: string;
+  /** 公众号 appsecret */
+  wechatSecret: string;
 
   // ---- 其他 ----
   /** 启动时自动打开工具条 */
@@ -51,16 +62,20 @@ export const DEFAULT_SETTINGS: CowriteSettings = {
   imageApiBase: 'https://api.openai.com/v1',
   imageApiKey: '',
   imageModel: 'dall-e-3',
-  imageSize: '1024x1024',
+  imageSizePreset: '16:9',
 
-  wechatToken: '',
-  zhihuToken: '',
-  xiaohongshuToken: '',
-  juejinToken: '',
+  wechatAppid: '',
+  wechatSecret: '',
 
   openOnStart: false,
   attachmentsDir: 'attachments',
 };
+
+/** 把预设解析成合法尺寸字符串；非法值回退到默认 16:9 */
+export function resolveImageSize(preset: string): string {
+  const p = (preset || '').trim() as ImageSizePreset;
+  return IMAGE_SIZE_MAP[p] || IMAGE_SIZE_MAP['16:9'];
+}
 
 export function normalizeSettings(loaded: Partial<CowriteSettings> | null): CowriteSettings {
   const merged: CowriteSettings = { ...DEFAULT_SETTINGS, ...(loaded ?? {}) };
@@ -72,7 +87,12 @@ export function normalizeSettings(loaded: Partial<CowriteSettings> | null): Cowr
 
   merged.imageApiBase = (merged.imageApiBase || '').trim() || DEFAULT_SETTINGS.imageApiBase;
   merged.imageModel = (merged.imageModel || '').trim() || DEFAULT_SETTINGS.imageModel;
-  merged.imageSize = (merged.imageSize || '').trim() || DEFAULT_SETTINGS.imageSize;
+  // 兼容旧版 imageSize 自由文本：若是已知预设映射则直接采用，否则落到默认 16:9
+  const preset = (merged.imageSizePreset || '').trim() as ImageSizePreset;
+  merged.imageSizePreset = ['1:1', '16:9', '9:16'].includes(preset) ? preset : '16:9';
+
+  merged.wechatAppid = (merged.wechatAppid || '').trim();
+  merged.wechatSecret = (merged.wechatSecret || '').trim();
 
   merged.attachmentsDir = (merged.attachmentsDir || '').trim() || 'attachments';
   return merged;
