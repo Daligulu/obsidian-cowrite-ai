@@ -16,13 +16,17 @@ import { ActionStore } from './actions';
 import { Executor } from './executor';
 import { testConnection } from './llm';
 import { ActionConfig, CowriteTask } from './types';
+import { VaultMap } from './agent/vaultMap';
+import { MemoryStore } from './agent/memory';
+import { findTool } from './agent/tools';
+import type { AgentEvent } from './agent/events';
 
 export const VIEW_TYPE_COWRITE = 'cowrite-ai-console';
 
 /**
- * Cowrite AI 主插件类。
- * 自包含：页面仓库 + 任务队列 + 内置 LLM 执行引擎，
- * 全部运行在 Obsidian 内（移动端可用），通过用户配置的 OpenAI 兼容 API 驱动。
+ * Cowrite AI 主插件类（v0.2：真 Agent）。
+ * 页面仓库 + 任务队列 + Agent 执行引擎（tool calling + 流式 + vault map + 长期记忆）。
+ * 纯浏览器/Obsidian API，移动端可用。
  */
 export default class CowriteAIPlugin extends Plugin {
   settings: CowriteSettings = { ...DEFAULT_SETTINGS };
@@ -30,18 +34,22 @@ export default class CowriteAIPlugin extends Plugin {
   tasks!: TaskStore;
   actions!: ActionStore;
   executor!: Executor;
+  vaultMap!: VaultMap;
+  memory!: MemoryStore;
 
   async onload() {
     this.settings = normalizeSettings(await this.loadData());
     this.pages = new PageStore(this.app.vault, this.settings.pagesDir);
     this.tasks = new TaskStore(this.app.vault, this.settings.tasksFile);
     this.actions = new ActionStore(this.app.vault, this.settings.actionsFile);
+    this.vaultMap = new VaultMap(this.app.vault);
+    this.memory = new MemoryStore(this.app.vault);
     this.executor = new Executor(this);
 
     // 注册控制台视图
     this.registerView(VIEW_TYPE_COWRITE, (leaf) => new CowriteConsoleView(leaf, this));
 
-    // 功能区图标：打开控制台
+    // 功能区图标
     this.addRibbonIcon('lucide-pen-tool', '打开 Cowrite AI 控制台', () => {
       void this.activateView();
     });
@@ -80,12 +88,27 @@ export default class CowriteAIPlugin extends Plugin {
     // 设置页
     this.addSettingTab(new CowriteSettingTab(this.app, this));
 
+    // vault 变更 → 失效 vault map 缓存
+    this.registerEvent(
+      this.app.vault.on('create', () => this.vaultMap.invalidate()),
+    );
+    this.registerEvent(
+      this.app.vault.on('modify', () => this.vaultMap.invalidate()),
+    );
+    this.registerEvent(
+      this.app.vault.on('delete', () => this.vaultMap.invalidate()),
+    );
+
+    // 后台懒构建 vault map（不阻塞首屏）
+    void this.vaultMap.loadFromCache().then(() => {
+      void this.vaultMap.ensureBuilt();
+    });
+
     // 启动执行器
     if (this.settings.executorEnabled) {
       this.executor.start();
     }
 
-    // 延迟初始化：启动时打开控制台
     this.app.workspace.onLayoutReady(() => {
       if (this.settings.openOnStart) {
         void this.activateView();
@@ -115,7 +138,6 @@ export default class CowriteAIPlugin extends Plugin {
     }
   }
 
-  /** 切换执行器启停 */
   toggleExecutor(): void {
     if (this.executor.isRunning()) {
       this.executor.stop();
@@ -131,7 +153,14 @@ export default class CowriteAIPlugin extends Plugin {
     this.refreshConsole();
   }
 
-  /** 刷新所有控制台视图 */
+  /** 切换默认模式（ask/write） */
+  toggleMode(): void {
+    this.settings.defaultMode = this.settings.defaultMode === 'ask' ? 'write' : 'ask';
+    void this.saveData(this.settings);
+    new Notice(`Cowrite AI: 模式已切换为 ${this.settings.defaultMode === 'ask' ? '问答（只读）' : '创作（可写）'}`);
+    this.refreshConsole();
+  }
+
   refreshConsole(): void {
     this.app.workspace.getLeavesOfType(VIEW_TYPE_COWRITE).forEach((leaf) => {
       if (leaf.view instanceof CowriteConsoleView) {
@@ -142,7 +171,6 @@ export default class CowriteAIPlugin extends Plugin {
 
   async saveSettings(): Promise<void> {
     await this.saveData(this.settings);
-    // 设置变更后重建 store，并按新配置重启执行器
     this.pages = new PageStore(this.app.vault, this.settings.pagesDir);
     this.tasks = new TaskStore(this.app.vault, this.settings.tasksFile);
     this.actions = new ActionStore(this.app.vault, this.settings.actionsFile);
@@ -159,8 +187,12 @@ export class CowriteConsoleView extends ItemView {
   private plugin: CowriteAIPlugin;
   private pageListEl!: HTMLElement;
   private taskListEl!: HTMLElement;
+  private detailEl!: HTMLElement;
   private statusEl!: HTMLElement;
   private btnToggle!: HTMLButtonElement;
+  private btnMode!: HTMLButtonElement;
+  private selectedTaskId: string | null = null;
+  private unsubscribe: (() => void) | null = null;
 
   constructor(leaf: WorkspaceLeaf, plugin: CowriteAIPlugin) {
     super(leaf);
@@ -198,6 +230,8 @@ export class CowriteConsoleView extends ItemView {
     });
     const btnRefresh = toolbar.createEl('button', { text: '↻ 刷新' });
     btnRefresh.addEventListener('click', () => void this.refresh());
+    this.btnMode = toolbar.createEl('button', { text: '' });
+    this.btnMode.addEventListener('click', () => this.plugin.toggleMode());
     this.btnToggle = toolbar.createEl('button', { text: '' });
     this.btnToggle.addEventListener('click', () => this.plugin.toggleExecutor());
 
@@ -211,20 +245,28 @@ export class CowriteConsoleView extends ItemView {
     tasksSection.createEl('h3', { text: '任务队列' });
     this.taskListEl = tasksSection.createDiv({ cls: 'cowrite-task-list' });
 
+    // 任务详情区（流式输出 + 工具卡片 + 审批）
+    const detailSection = this.contentEl.createDiv({ cls: 'cowrite-section' });
+    detailSection.createEl('h3', { text: '任务详情' });
+    this.detailEl = detailSection.createDiv({ cls: 'cowrite-detail' });
+    this.detailEl.createEl('div', { cls: 'cowrite-empty', text: '点击左侧任务查看流式输出。' });
+
     await this.refresh();
   }
 
   async onClose() {
+    if (this.unsubscribe) this.unsubscribe();
     this.contentEl.empty();
   }
 
-  /** 刷新页面列表与任务队列 */
   async refresh(): Promise<void> {
     if (!this.contentEl || this.contentEl.children.length === 0) return;
 
-    // 工具栏启停按钮文案
     if (this.btnToggle) {
       this.btnToggle.textContent = this.plugin.executor.isRunning() ? '⏸ 暂停执行器' : '▶ 启动执行器';
+    }
+    if (this.btnMode) {
+      this.btnMode.textContent = this.plugin.settings.defaultMode === 'ask' ? '🔍 问答模式' : '✍️ 创作模式';
     }
 
     // 页面列表
@@ -257,19 +299,20 @@ export class CowriteConsoleView extends ItemView {
       sorted.forEach((task) => this.renderTask(task));
     }
 
-    // 状态行
     const running = tasks.filter((t) => t.status === 'running').length;
     const queued = tasks.filter((t) => t.status === 'queued').length;
     const done = tasks.filter((t) => t.status === 'succeeded').length;
     const failed = tasks.filter((t) => t.status === 'failed').length;
     const execState = this.plugin.executor.isRunning() ? '运行中' : '已暂停';
     this.statusEl.setText(
-      `执行器：${execState} · 排队 ${queued} · 进行中 ${running} · 成功 ${done} · 失败 ${failed}`,
+      `执行器：${execState} · 模式：${this.plugin.settings.defaultMode === 'ask' ? '问答' : '创作'} · 排队 ${queued} · 进行中 ${running} · 成功 ${done} · 失败 ${failed}`,
     );
   }
 
   private renderTask(task: CowriteTask): void {
-    const row = this.taskListEl.createDiv({ cls: `cowrite-task-row cowrite-task-${task.status}` });
+    const row = this.taskListEl.createDiv({
+      cls: `cowrite-task-row cowrite-task-${task.status}${task.id === this.selectedTaskId ? ' cowrite-task-selected' : ''}`,
+    });
 
     const head = row.createDiv({ cls: 'cowrite-task-head' });
     head.createEl('span', { cls: 'cowrite-task-action', text: task.action });
@@ -277,9 +320,6 @@ export class CowriteConsoleView extends ItemView {
 
     if (task.pagePath) {
       row.createEl('div', { cls: 'cowrite-task-meta', text: `页面: ${task.pagePath}` });
-    }
-    if (task.workerId) {
-      row.createEl('div', { cls: 'cowrite-task-meta', text: `Worker: ${task.workerId}` });
     }
     if (task.requirements) {
       row.createEl('div', { cls: 'cowrite-task-meta', text: `要求: ${task.requirements}` });
@@ -291,27 +331,141 @@ export class CowriteConsoleView extends ItemView {
       row.createEl('div', { cls: 'cowrite-task-error', text: task.error });
     }
 
+    // 点击选中任务 → 订阅事件流
+    head.addEventListener('click', () => this.selectTask(task.id));
+
     const ops = row.createDiv({ cls: 'cowrite-task-ops' });
     if (task.status === 'failed') {
       const retry = ops.createEl('button', { cls: 'cowrite-btn-small', text: '重试' });
-      retry.addEventListener('click', async () => {
+      retry.addEventListener('click', async (e) => {
+        e.stopPropagation();
         await this.plugin.tasks.retry(task.id);
-        new Notice(`Cowrite AI: 任务 ${task.id} 已回到排队`);
         await this.refresh();
       });
     }
     if (task.status === 'queued') {
       const cancel = ops.createEl('button', { cls: 'cowrite-btn-small', text: '取消' });
-      cancel.addEventListener('click', async () => {
+      cancel.addEventListener('click', async (e) => {
+        e.stopPropagation();
         await this.plugin.tasks.cancel(task.id);
         await this.refresh();
       });
     }
     const del = ops.createEl('button', { cls: 'cowrite-btn-small', text: '删除' });
-    del.addEventListener('click', async () => {
+    del.addEventListener('click', async (e) => {
+      e.stopPropagation();
       await this.plugin.tasks.remove(task.id);
       await this.refresh();
     });
+  }
+
+  /** 选中任务：订阅事件流并渲染详情 */
+  private selectTask(taskId: string): void {
+    this.selectedTaskId = taskId;
+    if (this.unsubscribe) {
+      this.unsubscribe();
+      this.unsubscribe = null;
+    }
+    this.detailEl.empty();
+
+    // 50ms debounce 批量更新 DOM
+    let pending: AgentEvent[] = [];
+    let flushTimer: number | null = null;
+    const scheduleFlush = () => {
+      if (flushTimer !== null) return;
+      flushTimer = window.setTimeout(() => {
+        flushTimer = null;
+        const batch = pending;
+        pending = [];
+        for (const ev of batch) this.renderEvent(ev);
+      }, 50);
+    };
+
+    this.unsubscribe = this.plugin.executor.subscribe(taskId, (ev) => {
+      pending.push(ev);
+      scheduleFlush();
+    });
+
+    this.detailEl.createEl('div', { cls: 'cowrite-task-result', text: `任务 ${taskId} 已选中，等待事件流...` });
+  }
+
+  /** 渲染单个 Agent 事件到详情区 */
+  private renderEvent(ev: AgentEvent): void {
+    const detail = this.detailEl;
+    switch (ev.type) {
+      case 'text-delta': {
+        if (!ev.delta) return;
+        let last = detail.lastElementChild;
+        if (!last || !last.classList.contains('cowrite-stream-text')) {
+          last = detail.createDiv({ cls: 'cowrite-stream-text' });
+        }
+        last.textContent = (last.textContent ?? '') + ev.delta;
+        break;
+      }
+      case 'reasoning': {
+        const el = detail.createDiv({ cls: 'cowrite-stream-reasoning' });
+        el.textContent = '💭 ' + ev.delta;
+        break;
+      }
+      case 'tool-start': {
+        const card = detail.createDiv({ cls: 'cowrite-tool-card cowrite-tool-running' });
+        card.createEl('div', { cls: 'cowrite-tool-name', text: `🔧 ${ev.name} 执行中...` });
+        const argsPre = card.createEl('pre', { cls: 'cowrite-tool-args' });
+        argsPre.setText(JSON.stringify(ev.args, null, 2).slice(0, 400));
+        card.dataset.toolName = ev.name;
+        card.dataset.toolArgs = JSON.stringify(ev.args);
+        break;
+      }
+      case 'tool-end': {
+        // 找最后一个 running 卡片替换
+        const cards = detail.querySelectorAll('.cowrite-tool-card.cowrite-tool-running');
+        const card = cards.length > 0 ? cards[cards.length - 1] as HTMLElement : detail.createDiv({ cls: 'cowrite-tool-card' });
+        card.classList.remove('cowrite-tool-running');
+        card.classList.add(ev.isError ? 'cowrite-tool-error' : 'cowrite-tool-done');
+        card.empty();
+        // 调工具自带 render
+        const tool = findTool(ev.name);
+        if (tool && tool.render) {
+          try {
+            tool.render(JSON.parse(card.dataset.toolArgs || '{}'), ev.result, card);
+          } catch {
+            card.createEl('div', { cls: 'cowrite-tool-name', text: `${ev.name} 完成` });
+          }
+        } else {
+          card.createEl('div', { cls: 'cowrite-tool-name', text: `${ev.name} 完成` });
+        }
+        break;
+      }
+      case 'approval-request': {
+        const card = detail.createDiv({ cls: 'cowrite-approval-card' });
+        card.createEl('div', { cls: 'cowrite-approval-title', text: `⚠️ Agent 请求执行：${ev.toolName}` });
+        const argsPre = card.createEl('pre', { cls: 'cowrite-tool-args' });
+        argsPre.setText(JSON.stringify(ev.args, null, 2).slice(0, 400));
+        const btns = card.createDiv({ cls: 'cowrite-modal-btns' });
+        const ok = btns.createEl('button', { text: '同意执行' });
+        ok.addEventListener('click', () => {
+          card.empty();
+          card.createEl('div', { cls: 'cowrite-tool-done', text: '✓ 已同意，执行中...' });
+          ev.resolve(true);
+        });
+        const deny = btns.createEl('button', { text: '拒绝' });
+        deny.addEventListener('click', () => {
+          card.empty();
+          card.createEl('div', { cls: 'cowrite-tool-error', text: '✗ 已拒绝' });
+          ev.resolve(false);
+        });
+        break;
+      }
+      case 'error': {
+        detail.createEl('div', { cls: 'cowrite-task-error', text: '❌ ' + ev.error });
+        break;
+      }
+      case 'done': {
+        const el = detail.createDiv({ cls: 'cowrite-task-result' });
+        el.setText('✅ 任务完成' + (ev.finalText ? '：' + ev.finalText.slice(0, 200) : ''));
+        break;
+      }
+    }
   }
 }
 
@@ -381,7 +535,6 @@ export class NewTaskModal extends Modal {
     contentEl.empty();
     contentEl.createEl('h3', { text: '投递 Cowrite 任务' });
 
-    // 动作
     const actions: ActionConfig[] = await this.plugin.actions.list();
     const actionSel = contentEl.createEl('select', { cls: 'cowrite-input' });
     actions.forEach((a) => {
@@ -389,7 +542,6 @@ export class NewTaskModal extends Modal {
       opt.value = a.id;
     });
 
-    // 页面
     const files = await this.plugin.pages.list();
     const pageSel = contentEl.createEl('select', { cls: 'cowrite-input' });
     if (this.presetFile) {
@@ -540,7 +692,6 @@ class CowriteSettingTab extends PluginSettingTab {
           }),
       );
 
-    // 测试连接按钮
     new Setting(containerEl)
       .setName('测试连接')
       .setDesc('使用当前配置发送一条 ping 消息')
@@ -559,16 +710,113 @@ class CowriteSettingTab extends PluginSettingTab {
           }),
       );
 
+    // ---- 配图 ----
+    containerEl.createEl('h3', { text: '配图' });
+    new Setting(containerEl)
+      .setName('配图 API Base')
+      .setDesc('OpenAI 兼容 images/generations 接口地址，留空则禁用配图工具')
+      .addText((text) =>
+        text
+          .setPlaceholder('https://api.openai.com/v1')
+          .setValue(this.plugin.settings.imageApiBase)
+          .onChange(async (value) => {
+            this.plugin.settings.imageApiBase = value.trim();
+            await this.plugin.saveData(this.plugin.settings);
+          }),
+      );
+    new Setting(containerEl)
+      .setName('配图 API Key')
+      .setDesc('留空则回退使用主 API Key')
+      .addText((text) =>
+        text
+          .setPlaceholder('（留空用主 key）')
+          .setValue(this.plugin.settings.imageApiKey)
+          .onChange(async (value) => {
+            this.plugin.settings.imageApiKey = value.trim();
+            await this.plugin.saveData(this.plugin.settings);
+          }),
+      );
+    new Setting(containerEl)
+      .setName('配图模型')
+      .setDesc('例如 dall-e-3 / stable-diffusion 兼容')
+      .addText((text) =>
+        text
+          .setPlaceholder('dall-e-3')
+          .setValue(this.plugin.settings.imageModel)
+          .onChange(async (value) => {
+            this.plugin.settings.imageModel = value.trim() || 'dall-e-3';
+            await this.plugin.saveData(this.plugin.settings);
+          }),
+      );
+
     // ---- 执行引擎 ----
     containerEl.createEl('h3', { text: '执行引擎' });
     new Setting(containerEl)
       .setName('启用内置执行器')
-      .setDesc('插件自动轮询任务队列并调用 LLM 执行')
+      .setDesc('插件自动轮询任务队列并调用 Agent 执行')
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.executorEnabled).onChange(async (value) => {
           this.plugin.settings.executorEnabled = value;
           await this.plugin.saveSettings();
         }),
+      );
+
+    new Setting(containerEl)
+      .setName('默认模式')
+      .setDesc('ask=只读问答；write=可写笔记（写操作需审批）')
+      .addDropdown((dd) =>
+        dd
+          .addOption('ask', '问答（只读）')
+          .addOption('write', '创作（可写）')
+          .setValue(this.plugin.settings.defaultMode)
+          .onChange(async (value) => {
+            this.plugin.settings.defaultMode = value === 'ask' ? 'ask' : 'write';
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName('最大轮次')
+      .setDesc('单个任务最多 agent 轮次（防死循环）')
+      .addText((text) =>
+        text
+          .setPlaceholder('12')
+          .setValue(String(this.plugin.settings.maxTurns))
+          .onChange(async (value) => {
+            const n = parseInt(value, 10);
+            if (!Number.isNaN(n) && n > 0) {
+              this.plugin.settings.maxTurns = n;
+              await this.plugin.saveData(this.plugin.settings);
+            }
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName('上下文压缩触发比例')
+      .setDesc('历史 token 占用 contextWindow 该比例时开始压缩（0.5~0.95）')
+      .addSlider((slider) =>
+        slider
+          .setLimits(0.5, 0.95, 0.05)
+          .setValue(this.plugin.settings.compactThreshold)
+          .setDynamicTooltip()
+          .onChange(async (value) => {
+            this.plugin.settings.compactThreshold = value;
+            await this.plugin.saveData(this.plugin.settings);
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName('压缩保留尾部比例')
+      .setDesc('压缩时保留最近历史的比例（0.08~0.4）')
+      .addSlider((slider) =>
+        slider
+          .setLimits(0.08, 0.4, 0.02)
+          .setValue(this.plugin.settings.compactRetain)
+          .setDynamicTooltip()
+          .onChange(async (value) => {
+            this.plugin.settings.compactRetain = value;
+            await this.plugin.saveData(this.plugin.settings);
+          }),
       );
 
     new Setting(containerEl)
@@ -625,6 +873,19 @@ class CowriteSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.tasksFile)
           .onChange(async (value) => {
             this.plugin.settings.tasksFile = value.trim() || '.cowrite/tasks.json';
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName('动作配置文件')
+      .setDesc('动作 prompt 模板 JSON 文件（vault 内相对路径）')
+      .addText((text) =>
+        text
+          .setPlaceholder('.cowrite/actions.json')
+          .setValue(this.plugin.settings.actionsFile)
+          .onChange(async (value) => {
+            this.plugin.settings.actionsFile = value.trim() || '.cowrite/actions.json';
             await this.plugin.saveSettings();
           }),
       );
