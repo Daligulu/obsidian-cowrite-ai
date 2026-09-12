@@ -225,10 +225,23 @@ export class TaskStore {
     if (parent) {
       const parentFolder = this.vault.getAbstractFileByPath(parent);
       if (!parentFolder) {
-        await this.vault.createFolder(parent);
+        try {
+          await this.vault.createFolder(parent);
+        } catch (e) {
+          // 移动端 getAbstractFileByPath 对隐藏目录可能返回 null 但实际已存在，忽略 "already exists"
+          if (!(e instanceof Error && /already exists/i.test(e.message))) {
+            throw e;
+          }
+        }
       }
     }
-    await this.vault.create(this.tasksFile, JSON.stringify({ version: 1, tasks: [] } as TaskDataFile, null, 2));
+    try {
+      await this.vault.create(this.tasksFile, JSON.stringify({ version: 1, tasks: [] } as TaskDataFile, null, 2));
+    } catch (e) {
+      if (!(e instanceof Error && /already exists/i.test(e.message))) {
+        throw e;
+      }
+    }
   }
 
   private async finish(
