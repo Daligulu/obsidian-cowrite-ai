@@ -1,11 +1,13 @@
 import type { CowriteSettings } from './settings';
 import { chatComplete, readErrorBody } from './llm';
+import type { ImageStylePreset } from './imageStyles';
 
 /**
  * 图像生成：
- *  - buildImagePrompt：先用 LLM 根据标题+开头 300 字生成英文配图 prompt（不再硬编码拼后缀）
+ *  - buildImagePrompt：先用 LLM 根据标题+开头 300 字生成英文配图 prompt
  *  - generateImages：OpenAI 兼容 POST <imageApiBase>/images/generations，response_format=b64_json
- *    v0.5.0：body 增加 quality（standard/hd）；prompt 末尾自动拼接用户配置的 imageStyleSuffix。
+ *    v0.6：最终 prompt = LLM 描述 + stylePreset.promptSuffix + customSuffix；
+ *          不再使用 settings.imageStyleSuffix 全局拼接；negativePrompt 不传（OpenAI images API 不支持）。
  * 纯浏览器 fetch，base64 解码为 ArrayBuffer，无 Node 依赖，移动端可用。
  */
 
@@ -54,12 +56,21 @@ export async function buildImagePrompt(
   return raw.replace(/^["'“”‘’\s]+|["'“”‘’\s]+$/g, '').trim();
 }
 
-/** 生成 count 张图，返回每张图的 ArrayBuffer（PNG）。size 形如 "1792x1024"，不传则用设置默认。 */
+export interface GenerateImagesOptions {
+  /** 形如 "1792x1024"；不传则用默认 16:9 */
+  size?: string;
+  /** 弹窗里选的风格预设，其 promptSuffix 会被拼到 prompt 末尾 */
+  stylePreset?: ImageStylePreset;
+  /** 用户在"自定义描述"里追加的文本，无论选哪个风格都会拼 */
+  customSuffix?: string;
+}
+
+/** 生成 count 张图，返回每张图的 ArrayBuffer（PNG）。 */
 export async function generateImages(
   prompt: string,
   count: number,
   settings: CowriteSettings,
-  size?: string,
+  opts?: GenerateImagesOptions,
 ): Promise<ArrayBuffer[]> {
   const apiKey = (settings.imageApiKey || '').trim() || settings.apiKey;
   if (!apiKey) {
@@ -69,14 +80,20 @@ export async function generateImages(
     throw new Error('配图提示词为空');
   }
   const url = buildImagesUrl(settings.imageApiBase);
-  // 末尾自动拼接用户配置的风格后缀（非空时）
-  const suffix = (settings.imageStyleSuffix || '').trim();
-  const finalPrompt = suffix ? `${prompt.trim()}, ${suffix}` : prompt.trim();
+
+  // 组装最终 prompt：LLM 描述 + 预设后缀 + 用户自定义追加
+  const parts: string[] = [prompt.trim()];
+  const presetSuffix = (opts?.stylePreset?.promptSuffix || '').trim();
+  if (presetSuffix) parts.push(presetSuffix);
+  const customSuffix = (opts?.customSuffix || '').trim();
+  if (customSuffix) parts.push(customSuffix);
+  const finalPrompt = parts.join(', ');
+
   const body: Record<string, unknown> = {
     model: settings.imageModel,
     prompt: finalPrompt,
     n: Math.max(1, Math.min(4, count)),
-    size: size || '1792x1024',
+    size: opts?.size || '1792x1024',
     response_format: 'b64_json',
     quality: settings.imageQuality === 'hd' ? 'hd' : 'standard',
   };

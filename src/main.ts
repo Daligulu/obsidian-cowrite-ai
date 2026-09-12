@@ -14,6 +14,7 @@ import {
   CowriteSettings,
   DEFAULT_SETTINGS,
   IMAGE_SIZE_MAP,
+  IMAGE_SIZE_PRESETS,
   ImageSizePreset,
   normalizeSettings,
   resolveImageSize,
@@ -22,6 +23,11 @@ import { parseError, testConnection } from './llm';
 import { getSelection, getFullText, replaceFullText } from './editorContext';
 import { rewrite, rewriteLabel, RewriteMode } from './rewrite';
 import { buildImagePrompt, generateImages } from './imageGen';
+import {
+  getImageStyle,
+  IMAGE_STYLE_PRESETS,
+  type ImageStylePreset,
+} from './imageStyles';
 import { formatMarkdown, markdownToWechatHtml, smartFormatWithLLM } from './formatMd';
 import { GZH_THEMES, getTheme } from './themes';
 import {
@@ -237,8 +243,15 @@ class CowriteToolbarView extends ItemView {
       new Notice('请先打开一篇笔记');
       return;
     }
-    const pos = await openImageModal(this.app);
-    if (!pos) return;
+    const picked = await openImageModal(this.app, this.plugin.settings);
+    if (!picked) return;
+    const { pos, stylePreset, sizePreset, customDesc } = picked;
+
+    // 记住本次选择，下次打开弹窗预填
+    this.plugin.settings.lastImageStyle = picked.styleId;
+    this.plugin.settings.lastCustomStyle = customDesc;
+    this.plugin.settings.imageSizePreset = sizePreset;
+    await this.plugin.saveSettings();
 
     btn.setDisabled(true);
     const original = btn.buttonEl.textContent ?? '';
@@ -254,8 +267,8 @@ class CowriteToolbarView extends ItemView {
         .trim();
       const prompt = await buildImagePrompt(title, plainHead, this.plugin.settings);
 
-      // 尺寸：所有位置默认走设置里的预设（默认 16:9 横版）
-      const size = resolveImageSize(this.plugin.settings.imageSizePreset);
+      // 尺寸：用弹窗里选的预设
+      const size = resolveImageSize(sizePreset);
 
       // 决定生成几张
       let count = 1;
@@ -274,7 +287,11 @@ class CowriteToolbarView extends ItemView {
       const names: string[] = [];
       for (let i = 0; i < count; i++) {
         btn.setButtonText(`正在生成配图 ${i + 1}/${count}...`);
-        const buffers = await generateImages(prompt, 1, this.plugin.settings, size);
+        const buffers = await generateImages(prompt, 1, this.plugin.settings, {
+          size,
+          stylePreset,
+          customSuffix: customDesc,
+        });
         const fname = `cowrite-${ts}-${i}.png`;
         const fpath = `${dir}/${fname}`;
         await this.app.vault.createBinary(fpath, buffers[0]);
@@ -484,41 +501,138 @@ function openRewriteModal(app: App): Promise<RewriteChoice | null> {
 }
 
 // ---------------------------------------------------------------------------
-// Modal：文章配图（只选位置，尺寸自动带 16:9）
+// Modal：文章配图（位置 + 风格预设 + 尺寸 + 自定义描述）
 // ---------------------------------------------------------------------------
 
 type ImagePos = 'start' | 'between' | 'end';
 
-function openImageModal(app: App): Promise<ImagePos | null> {
+interface ImageModalChoice {
+  pos: ImagePos;
+  /** 最终生效的风格预设（选 custom 时会把用户输入的描述塞进 promptSuffix） */
+  stylePreset: ImageStylePreset;
+  /** 用户在弹窗里实际选的风格 id（用于回写 settings.lastImageStyle） */
+  styleId: string;
+  sizePreset: ImageSizePreset;
+  /** 用户在"自定义描述"里追加的文本 */
+  customDesc: string;
+}
+
+function openImageModal(app: App, settings: CowriteSettings): Promise<ImageModalChoice | null> {
   return new Promise((resolve) => {
     let done = false;
     const modal = new Modal(app);
     modal.titleEl.setText('文章配图');
-    const sel = modal.contentEl.createEl('select', { cls: 'cowrite-input' });
+    const body = modal.contentEl;
+
+    // ---- 配图位置 ----
+    body.createEl('label', { text: '配图位置' }).addClass('cowrite-desc');
+    const posSel = body.createEl('select', { cls: 'cowrite-input' });
     [
       { v: 'start', t: '开头（封面）' },
       { v: 'between', t: '每段之间（最多 3 张）' },
       { v: 'end', t: '结尾' },
     ].forEach((o) => {
-      const opt = sel.createEl('option', { text: o.t, value: o.v });
+      const opt = posSel.createEl('option', { text: o.t, value: o.v });
       opt.value = o.v;
     });
-    const hint = modal.contentEl.createEl('p', {
-      cls: 'cowrite-desc',
-      text: '尺寸自动按设置中的配图预设（默认 16:9 横版），无需手动选择。',
+
+    // ---- 配图风格（下拉；选"自定义"时换成文本输入框） ----
+    body.createEl('label', { text: '配图风格' }).addClass('cowrite-desc');
+    const styleSel = body.createEl('select', { cls: 'cowrite-input' });
+    IMAGE_STYLE_PRESETS.forEach((p) => {
+      const opt = styleSel.createEl('option', { text: p.name, value: p.id });
+      opt.value = p.id;
     });
-    void hint;
-    const btns = modal.contentEl.createDiv({ cls: 'cowrite-modal-btns' });
-    const ok = btns.createEl('button', { text: '生成' });
+    // 选 custom 时替换成的文本框
+    const customStyleInput = body.createEl('input', {
+      type: 'text',
+      cls: 'cowrite-input',
+      placeholder: '自己写风格描述，例如：neon cyberpunk illustration, dark background, glowing edges',
+    });
+    customStyleInput.style.display = 'none';
+
+    const sceneHint = body.createEl('p', { cls: 'cowrite-desc' });
+    sceneHint.style.marginTop = '4px';
+
+    // ---- 尺寸 ----
+    body.createEl('label', { text: '尺寸' }).addClass('cowrite-desc');
+    const sizeSel = body.createEl('select', { cls: 'cowrite-input' });
+    IMAGE_SIZE_PRESETS.forEach((s) => {
+      const opt = sizeSel.createEl('option', {
+        text: `${s}  (${IMAGE_SIZE_MAP[s]})`,
+        value: s,
+      });
+      opt.value = s;
+    });
+
+    // ---- 自定义描述（无论选哪个风格都会追加到 prompt 末尾） ----
+    body.createEl('label', { text: '自定义描述（追加到 prompt 末尾，可空）' }).addClass('cowrite-desc');
+    const customDescInput = body.createEl('input', {
+      type: 'text',
+      cls: 'cowrite-input',
+      placeholder: '例如：左上角留标题位、不要出现人脸',
+    });
+
+    // ---- 预填上次选择 ----
+    const lastStyleId = IMAGE_STYLE_PRESETS.some((p) => p.id === settings.lastImageStyle)
+      ? settings.lastImageStyle
+      : 'clean-illustration';
+    styleSel.value = lastStyleId;
+    customDescInput.value = settings.lastCustomStyle || '';
+    const lastSize = IMAGE_SIZE_PRESETS.includes(settings.imageSizePreset)
+      ? settings.imageSizePreset
+      : '16:9';
+    sizeSel.value = lastSize;
+
+    const syncStyleUi = () => {
+      const isCustom = styleSel.value === 'custom';
+      styleSel.style.display = isCustom ? 'none' : '';
+      customStyleInput.style.display = isCustom ? '' : 'none';
+      if (!isCustom) {
+        const preset = getImageStyle(styleSel.value);
+        sceneHint.setText(preset.scene);
+      } else {
+        sceneHint.setText('在上方输入框里写你想要的风格描述。');
+      }
+    };
+    styleSel.addEventListener('change', syncStyleUi);
+    syncStyleUi();
+
+    const btns = body.createDiv({ cls: 'cowrite-modal-btns' });
+    const ok = btns.createEl('button', { text: '开始生成' });
     ok.addClass('mod-cta');
     const cancel = btns.createEl('button', { text: '取消' });
-    const finish = (v: ImagePos | null) => {
+
+    const finish = (v: ImageModalChoice | null) => {
       if (done) return;
       done = true;
       modal.close();
       resolve(v);
     };
-    ok.addEventListener('click', () => finish((sel.value as ImagePos) || 'start'));
+
+    ok.addEventListener('click', () => {
+      const styleId = styleSel.value;
+      let stylePreset: ImageStylePreset;
+      if (styleId === 'custom') {
+        // 自定义：把用户输入的风格文本当作 promptSuffix
+        stylePreset = {
+          id: 'custom',
+          name: '自定义',
+          scene: '',
+          promptSuffix: customStyleInput.value.trim(),
+          negativePrompt: '',
+        };
+      } else {
+        stylePreset = getImageStyle(styleId);
+      }
+      finish({
+        pos: (posSel.value as ImagePos) || 'start',
+        stylePreset,
+        styleId,
+        sizePreset: (sizeSel.value as ImageSizePreset) || '16:9',
+        customDesc: customDescInput.value.trim(),
+      });
+    });
     cancel.addEventListener('click', () => finish(null));
     modal.onClose = () => finish(null);
     modal.open();
@@ -944,19 +1058,20 @@ class CowriteSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('配图尺寸')
-      .setDesc('所有配图位置默认使用此尺寸；16:9 为横版封面/正文图规格')
-      .addDropdown((d) =>
-        d.addOptions({
-          '1:1': `1:1 (${IMAGE_SIZE_MAP['1:1']})`,
-          '16:9': `16:9 (${IMAGE_SIZE_MAP['16:9']})`,
-          '9:16': `9:16 (${IMAGE_SIZE_MAP['9:16']})`,
-        })
+      .setDesc('配图弹窗里的默认尺寸；弹窗内仍可临时切换')
+      .addDropdown((d) => {
+        const opts: Record<string, string> = {};
+        IMAGE_SIZE_PRESETS.forEach((s) => {
+          opts[s] = `${s}  (${IMAGE_SIZE_MAP[s]})`;
+        });
+        d.addOptions(opts)
           .setValue(this.plugin.settings.imageSizePreset)
           .onChange(async (v) => {
-            this.plugin.settings.imageSizePreset = (v as ImageSizePreset) || '16:9';
+            this.plugin.settings.imageSizePreset =
+              (v as ImageSizePreset) || '16:9';
             await this.plugin.saveSettings();
-          }),
-      );
+          });
+      });
 
     // ---- 公众号排版主题 ----
     containerEl.createEl('h3', { text: '公众号排版主题' });
