@@ -500,11 +500,16 @@ export class NewPageModal extends Modal {
     const btns = contentEl.createDiv({ cls: 'cowrite-modal-btns' });
     const ok = btns.createEl('button', { text: '创建' });
     ok.addEventListener('click', async () => {
-      const file = await this.plugin.pages.create(titleInput.value, contentInput.value);
-      this.close();
-      if (file) {
-        void this.plugin.app.workspace.openLinkText(file.path, '', false);
-        this.plugin.refreshConsole();
+      try {
+        const file = await this.plugin.pages.create(titleInput.value, contentInput.value);
+        this.close();
+        if (file) {
+          void this.plugin.app.workspace.openLinkText(file.path, '', false);
+          this.plugin.refreshConsole();
+        }
+      } catch (err) {
+        console.error('Cowrite AI: 新建页面失败', err);
+        new Notice(`Cowrite AI: 新建页面失败 - ${err instanceof Error ? err.message : String(err)}`);
       }
     });
     const cancel = btns.createEl('button', { text: '取消' });
@@ -567,17 +572,22 @@ export class NewTaskModal extends Modal {
         new Notice('Cowrite AI: 请选择目标页面');
         return;
       }
-      const task = await this.plugin.tasks.create(
-        {
-          action: actionId,
-          pagePath,
-          requirements: reqInput.value || undefined,
-        },
-        action?.skills ?? [],
-      );
-      new Notice(`Cowrite AI: 任务 ${task.id} 已投递（${action?.label ?? actionId}）`);
-      this.close();
-      this.plugin.refreshConsole();
+      try {
+        const task = await this.plugin.tasks.create(
+          {
+            action: actionId,
+            pagePath,
+            requirements: reqInput.value || undefined,
+          },
+          action?.skills ?? [],
+        );
+        new Notice(`Cowrite AI: 任务 ${task.id} 已投递（${action?.label ?? actionId}）`);
+        this.close();
+        this.plugin.refreshConsole();
+      } catch (err) {
+        console.error('Cowrite AI: 投递任务失败', err);
+        new Notice(`Cowrite AI: 投递失败 - ${err instanceof Error ? err.message : String(err)}`);
+      }
     });
     const cancel = btns.createEl('button', { text: '取消' });
     cancel.addEventListener('click', () => this.close());
