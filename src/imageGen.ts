@@ -3,13 +3,11 @@ import { chatComplete, readErrorBody } from './llm';
 
 /**
  * 图像生成：
- *  - buildImagePrompt：先用 LLM 根据标题+开头 300 字生成英文配图 prompt，末尾拼统一风格后缀
+ *  - buildImagePrompt：先用 LLM 根据标题+开头 300 字生成英文配图 prompt（不再硬编码拼后缀）
  *  - generateImages：OpenAI 兼容 POST <imageApiBase>/images/generations，response_format=b64_json
+ *    v0.5.0：body 增加 quality（standard/hd）；prompt 末尾自动拼接用户配置的 imageStyleSuffix。
  * 纯浏览器 fetch，base64 解码为 ArrayBuffer，无 Node 依赖，移动端可用。
  */
-
-/** 所有配图统一追加的风格后缀 */
-const STYLE_SUFFIX = ', clean illustration style, soft colors, professional editorial';
 
 function buildImagesUrl(apiBase: string): string {
   const base = (apiBase || '').trim().replace(/\/+$/, '');
@@ -31,7 +29,7 @@ export function base64ToArrayBuffer(b64: string): ArrayBuffer {
 
 /**
  * 用 LLM 根据文章标题 + 开头 300 字，生成适合配图的英文 prompt。
- * 输出风格描述 + 内容描述；末尾自动追加统一风格后缀。
+ * 仅返回 LLM 清洗后的 prompt 本体；风格后缀由 generateImages() 统一拼接。
  */
 export async function buildImagePrompt(
   title: string,
@@ -53,8 +51,7 @@ export async function buildImagePrompt(
     ],
     { temperature: 0.6, maxTokens: 160 },
   );
-  const cleaned = raw.replace(/^["'“”‘’\s]+|["'“”‘’\s]+$/g, '').trim();
-  return `${cleaned}${STYLE_SUFFIX}`;
+  return raw.replace(/^["'“”‘’\s]+|["'“”‘’\s]+$/g, '').trim();
 }
 
 /** 生成 count 张图，返回每张图的 ArrayBuffer（PNG）。size 形如 "1792x1024"，不传则用设置默认。 */
@@ -72,12 +69,16 @@ export async function generateImages(
     throw new Error('配图提示词为空');
   }
   const url = buildImagesUrl(settings.imageApiBase);
+  // 末尾自动拼接用户配置的风格后缀（非空时）
+  const suffix = (settings.imageStyleSuffix || '').trim();
+  const finalPrompt = suffix ? `${prompt.trim()}, ${suffix}` : prompt.trim();
   const body: Record<string, unknown> = {
     model: settings.imageModel,
-    prompt,
+    prompt: finalPrompt,
     n: Math.max(1, Math.min(4, count)),
     size: size || '1792x1024',
     response_format: 'b64_json',
+    quality: settings.imageQuality === 'hd' ? 'hd' : 'standard',
   };
 
   const controller = new AbortController();

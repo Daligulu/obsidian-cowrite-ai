@@ -37,6 +37,14 @@ export interface CowriteSettings {
   imageModel: string;
   /** 配图尺寸预设（1:1 / 16:9 / 9:16），所有位置默认走 16:9 横版 */
   imageSizePreset: ImageSizePreset;
+  /** 图像质量：standard / hd（hd 仅 dall-e-3 支持） */
+  imageQuality: 'standard' | 'hd';
+  /** 拼接到 prompt 末尾的风格后缀，空串表示不拼接 */
+  imageStyleSuffix: string;
+
+  // ---- 公众号排版主题 ----
+  /** gzh-design 主题 id，见 themes.ts；默认 graphite-minimal */
+  gzhTheme: string;
 
   // ---- 公众号发布配置（真实 API） ----
   /** 公众号 appid */
@@ -63,6 +71,10 @@ export const DEFAULT_SETTINGS: CowriteSettings = {
   imageApiKey: '',
   imageModel: 'dall-e-3',
   imageSizePreset: '16:9',
+  imageQuality: 'standard',
+  imageStyleSuffix: 'clean illustration style, soft colors, professional editorial',
+
+  gzhTheme: 'graphite-minimal',
 
   wechatAppid: '',
   wechatSecret: '',
@@ -90,6 +102,14 @@ export function normalizeSettings(loaded: Partial<CowriteSettings> | null): Cowr
   // 兼容旧版 imageSize 自由文本：若是已知预设映射则直接采用，否则落到默认 16:9
   const preset = (merged.imageSizePreset || '').trim() as ImageSizePreset;
   merged.imageSizePreset = ['1:1', '16:9', '9:16'].includes(preset) ? preset : '16:9';
+  merged.imageQuality = merged.imageQuality === 'hd' ? 'hd' : 'standard';
+  // 风格后缀允许空串（表示不拼接），不做 trim 强制，保留用户输入
+  merged.imageStyleSuffix =
+    typeof merged.imageStyleSuffix === 'string'
+      ? merged.imageStyleSuffix
+      : DEFAULT_SETTINGS.imageStyleSuffix;
+
+  merged.gzhTheme = (merged.gzhTheme || '').trim() || DEFAULT_SETTINGS.gzhTheme;
 
   merged.wechatAppid = (merged.wechatAppid || '').trim();
   merged.wechatSecret = (merged.wechatSecret || '').trim();

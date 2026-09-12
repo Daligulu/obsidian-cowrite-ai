@@ -1,5 +1,6 @@
 import type { CowriteSettings } from './settings';
 import { chatComplete } from './llm';
+import { getTheme, type GzhTheme } from './themes';
 
 /**
  * Markdown 排版：
@@ -289,15 +290,18 @@ export async function smartFormatWithLLM(md: string, settings: CowriteSettings):
 }
 
 // ---------------------------------------------------------------------------
-// Markdown → 公众号内联样式 HTML
+// Markdown → 公众号内联样式 HTML（gzh-design 主题化）
 // ---------------------------------------------------------------------------
+
+const FONT_STACK =
+  '-apple-system, BlinkMacSystemFont, "Helvetica Neue", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif';
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-/** 处理行内样式：图片、链接、加粗、斜体、行内代码、高亮 */
-function inlineHtml(text: string): string {
+/** 处理行内样式：图片、链接、加粗、斜体、行内代码、高亮；全部按主题变量内联 */
+function inlineHtml(text: string, t: GzhTheme): string {
   let s = escapeHtml(text);
   // 图片 ![alt](src)
   s = s.replace(
@@ -307,33 +311,41 @@ function inlineHtml(text: string): string {
   // 链接 [text](url)
   s = s.replace(
     /\[([^\]]+)\]\(([^)]+)\)/g,
-    `<a href="$2" style="color: #576b95; text-decoration: none;">$1</a>`,
+    `<a href="$2" style="color: ${t.accent}; text-decoration: none;">$1</a>`,
   );
   // 高亮 ==text==
-  s = s.replace(/==([^=\n]+)==/g, `<mark style="background: #fff3a3; padding: 0 2px;">$1</mark>`);
+  s = s.replace(
+    /==([^=\n]+)==/g,
+    `<mark style="background: #fff3a3; padding: 0 2px;">$1</mark>`,
+  );
   // 加粗 **text**
   s = s.replace(/\*\*([^*\n]+)\*\*/g, `<strong style="font-weight: 600;">$1</strong>`);
   // 斜体 *text*
   s = s.replace(/(^|[^*])\*([^*\n]+)\*/g, `$1<em>$2</em>`);
   // 行内代码 `code`
-  s = s.replace(/`([^`\n]+)`/g, `<code style="background: #f6f8fa; padding: 2px 4px; border-radius: 3px; font-size: 14px; color: #c7254e;">$1</code>`);
+  s = s.replace(
+    /`([^`\n]+)`/g,
+    `<code style="background: ${t.codeBg}; padding: 0.1em 0.3em; border-radius: ${t.borderRadius}; font-size: 0.9em; color: ${t.bodyColor};">$1</code>`,
+  );
   return s;
 }
 
 /**
  * 把 Markdown 转成公众号编辑器可粘贴的 HTML：
- * 所有样式内联，无 class/id。
+ * 所有样式内联，无 class/id；外层包一个 <section>，按 themeId 选主题变量。
+ * 默认主题 graphite-minimal。
  */
-export function markdownToWechatHtml(md: string): string {
+export function markdownToWechatHtml(md: string, themeId?: string): string {
+  const t = getTheme(themeId || 'graphite-minimal');
   const lines = md.replace(/\r\n?/g, '\n').split('\n');
   const html: string[] = [];
   let inCode = false;
-  let listOpen = false;
+  let listOpen: 'ul' | 'ol' | null = null;
 
   const closeList = () => {
     if (listOpen) {
-      html.push('</ul>');
-      listOpen = false;
+      html.push(`</${listOpen}>`);
+      listOpen = null;
     }
   };
 
@@ -344,7 +356,7 @@ export function markdownToWechatHtml(md: string): string {
       inCode = !inCode;
       if (inCode) {
         html.push(
-          `<pre style="margin: 1em 0; padding: 12px; background: #f6f8fa; border-radius: 4px; overflow-x: auto; font-size: 14px; line-height: 1.6; color: #333;"><code>${escapeHtml(line.replace(/^\s*(```|~~~)/, ''))}\n`,
+          `<pre style="margin: 1em 0; padding: 1em; background: ${t.codeBg}; border-radius: ${t.borderRadius}; overflow-x: auto; font-size: 14px; line-height: 1.6; color: ${t.bodyColor};"><code>${escapeHtml(line.replace(/^\s*(```|~~~)/, ''))}\n`,
         );
       } else {
         html.push('</code></pre>');
@@ -356,53 +368,84 @@ export function markdownToWechatHtml(md: string): string {
       continue;
     }
 
-    const t = line.trim();
-    if (t === '') {
+    const tr = line.trim();
+    if (tr === '') {
       closeList();
       continue;
     }
 
-    // 标题
-    const h = /^(#{1,6})\s+(.*)$/.exec(t);
-    if (h) {
+    // 分割线
+    if (/^(-{3,}|\*{3,}|_{3,})$/.test(tr)) {
       closeList();
-      const level = Math.min(6, h[1].length);
-      const fontSize = level === 1 ? 22 : level === 2 ? 20 : level === 3 ? 18 : 16;
       html.push(
-        `<h${level} style="margin: 1.5em 0 0.5em; font-weight: 600; font-size: ${fontSize}px; color: #1f1f1f;">${inlineHtml(h[2])}</h${level}>`,
+        `<hr style="border: none; border-top: 1px solid ${t.borderColor}; margin: 2em 0;" />`,
       );
       continue;
     }
 
-    // 引用
-    if (/^>\s?/.test(t)) {
+    // 标题
+    const h = /^(#{1,6})\s+(.*)$/.exec(tr);
+    if (h) {
       closeList();
-      const inner = t.replace(/^>\s?/, '');
+      const level = Math.min(6, h[1].length);
+      const fontSize = level === 1 ? 22 : level === 2 ? 20 : level === 3 ? 18 : 16;
+      let style: string;
+      if (level === 1 || level === 2) {
+        style = `color: ${t.headingColor}; border-left: 4px solid ${t.accent}; padding-left: 0.5em; margin: 1.5em 0 0.5em; font-weight: 600; font-size: ${fontSize}px;`;
+      } else {
+        style = `color: ${t.headingColor}; margin: 1.2em 0 0.5em; font-weight: 600; font-size: ${fontSize}px;`;
+      }
+      html.push(`<h${level} style="${style}">${inlineHtml(h[2], t)}</h${level}>`);
+      continue;
+    }
+
+    // 引用
+    if (/^>\s?/.test(tr)) {
+      closeList();
+      const inner = tr.replace(/^>\s?/, '');
       html.push(
-        `<blockquote style="margin: 1em 0; padding: 0.5em 1em; border-left: 3px solid #ddd; color: #666; background: #fafafa;">${inlineHtml(inner)}</blockquote>`,
+        `<blockquote style="background: ${t.quoteBg}; border-left: 3px solid ${t.accent}; padding: 0.5em 1em; margin: 1em 0; color: ${t.mutedColor}; border-radius: ${t.borderRadius};">${inlineHtml(inner, t)}</blockquote>`,
       );
       continue;
     }
 
     // 无序列表
-    if (/^[-*+]\s+/.test(t)) {
-      if (!listOpen) {
-        html.push('<ul style="margin: 0.5em 0; padding-left: 1.5em; color: #3f3f3f; line-height: 1.75;">');
-        listOpen = true;
+    if (/^[-*+]\s+/.test(tr)) {
+      if (listOpen !== 'ul') {
+        closeList();
+        html.push(
+          `<ul style="padding-left: 1.5em; margin: 1em 0; color: ${t.bodyColor}; line-height: 1.75;">`,
+        );
+        listOpen = 'ul';
       }
-      const inner = t.replace(/^[-*+]\s+/, '');
-      html.push(`<li style="margin: 0.25em 0;">${inlineHtml(inner)}</li>`);
+      const inner = tr.replace(/^[-*+]\s+/, '');
+      html.push(`<li style="margin: 0.25em 0;">${inlineHtml(inner, t)}</li>`);
+      continue;
+    }
+
+    // 有序列表
+    if (/^\d+\.\s+/.test(tr)) {
+      if (listOpen !== 'ol') {
+        closeList();
+        html.push(
+          `<ol style="padding-left: 1.5em; margin: 1em 0; color: ${t.bodyColor}; line-height: 1.75;">`,
+        );
+        listOpen = 'ol';
+      }
+      const inner = tr.replace(/^\d+\.\s+/, '');
+      html.push(`<li style="margin: 0.25em 0;">${inlineHtml(inner, t)}</li>`);
       continue;
     }
 
     // 普通段落
     closeList();
     html.push(
-      `<p style="margin: 0 0 1em; line-height: 1.75; font-size: 16px; color: #3f3f3f;">${inlineHtml(t)}</p>`,
+      `<p style="color: ${t.bodyColor}; margin: 0 0 1em; line-height: 1.75; font-size: 16px;">${inlineHtml(tr, t)}</p>`,
     );
   }
   closeList();
   if (inCode) html.push('</code></pre>');
 
-  return html.join('\n');
+  const inner = html.join('\n');
+  return `<section style="font-family: ${FONT_STACK}; line-height: 1.75; font-size: 16px; color: ${t.bodyColor}; margin: 0; padding: 0;">\n${inner}\n</section>`;
 }

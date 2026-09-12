@@ -23,6 +23,7 @@ import { getSelection, getFullText, replaceFullText } from './editorContext';
 import { rewrite, rewriteLabel, RewriteMode } from './rewrite';
 import { buildImagePrompt, generateImages } from './imageGen';
 import { formatMarkdown, markdownToWechatHtml, smartFormatWithLLM } from './formatMd';
+import { GZH_THEMES, getTheme } from './themes';
 import {
   isWechatConfigured,
   PUBLISH_PLATFORMS,
@@ -310,16 +311,22 @@ class CowriteToolbarView extends ItemView {
     }
   }
 
-  // ---- 按钮 3：文章排版（纯正则 / LLM 智能排版 + 公众号 HTML 复制） ----
+  // ---- 按钮 3：文章排版（规则 / 智能 / 导出公众号 HTML） ----
   private async handleFormat(btn: ButtonComponent): Promise<void> {
     const ctx = await getFullText(this.app);
     if (!ctx) {
       new Notice('请先打开一篇笔记');
       return;
     }
-    const useSmart = await openFormatModal(this.app);
-    if (useSmart === null) return;
+    const choice = await openFormatModal(this.app, this.plugin.settings.gzhTheme, ctx.content);
+    if (choice === null) return;
 
+    // c) 导出公众号 HTML：弹窗内已完成复制，这里直接返回
+    if (choice.kind === 'html') {
+      return;
+    }
+
+    const useSmart = choice.kind === 'smart';
     btn.setDisabled(true);
     const original = btn.buttonEl.textContent ?? '';
     btn.setButtonText(useSmart ? '正在智能排版...' : '正在排版...');
@@ -336,7 +343,7 @@ class CowriteToolbarView extends ItemView {
         await replaceFullText(this.app, ctx.file, formatted);
       }
       // 排版完成：toast 带"复制为公众号 HTML"按钮
-      showFormatDoneNotice(formatted);
+      showFormatDoneNotice(formatted, this.plugin.settings.gzhTheme);
     } finally {
       btn.buttonEl.removeClass('cowrite-busy');
       btn.setButtonText(original);
@@ -373,7 +380,7 @@ class CowriteToolbarView extends ItemView {
             }
           }
         }
-        const html = markdownToWechatHtml(ctx.content);
+        const html = markdownToWechatHtml(ctx.content, this.plugin.settings.gzhTheme);
         const r = await publishWechatDraft(this.plugin.settings, {
           title: choice.title,
           author: choice.author,
@@ -401,7 +408,7 @@ function extractFirstImage(md: string): string | null {
 }
 
 /** 排版完成 toast：带"复制为公众号 HTML"按钮 */
-function showFormatDoneNotice(formattedMd: string): void {
+function showFormatDoneNotice(formattedMd: string, themeId?: string): void {
   const notice = new Notice('', 8000);
   notice.noticeEl.addClass('cowrite-format-notice');
   const textEl = notice.noticeEl.createEl('div', { text: '已排版' });
@@ -411,9 +418,10 @@ function showFormatDoneNotice(formattedMd: string): void {
   btn.style.width = '100%';
   btn.addEventListener('click', async () => {
     try {
-      const html = markdownToWechatHtml(formattedMd);
+      const html = markdownToWechatHtml(formattedMd, themeId);
       await navigator.clipboard.writeText(html);
-      new Notice('已复制公众号 HTML');
+      const theme = getTheme(themeId || 'graphite-minimal');
+      new Notice(`已复制公众号 HTML（${theme.name}）`);
       notice.hide();
     } catch (e) {
       new Notice(`复制失败：${parseError(e)}`, 6000);
@@ -518,33 +526,117 @@ function openImageModal(app: App): Promise<ImagePos | null> {
 }
 
 // ---------------------------------------------------------------------------
-// Modal：文章排版（智能排版开关）
+// Modal：文章排版（三选项：规则排版 / 智能排版 / 导出公众号 HTML）
 // ---------------------------------------------------------------------------
 
-/** 返回 null 表示取消；返回 boolean 表示是否启用智能排版 */
-function openFormatModal(app: App): Promise<boolean | null> {
+type FormatChoice =
+  | { kind: 'rule' }
+  | { kind: 'smart' }
+  | { kind: 'html' };
+
+/**
+ * 返回 null 表示取消。
+ *  - rule/smart：回主流程执行编辑器内替换
+ *  - html：弹窗内已完成主题选择 + 复制到剪贴板，主流程不再动编辑器
+ */
+function openFormatModal(app: App, defaultThemeId: string, md: string): Promise<FormatChoice | null> {
   return new Promise((resolve) => {
     let done = false;
     const modal = new Modal(app);
     modal.titleEl.setText('文章排版');
 
-    const label = modal.contentEl.createEl('label', { cls: 'cowrite-row' });
-    const toggle = label.createEl('input', { type: 'checkbox' });
-    label.createEl('span', { text: '智能排版（调 LLM：长段拆分 / 关键词高亮 / 章节编号）' });
+    const body = modal.contentEl;
 
-    const btns = modal.contentEl.createDiv({ cls: 'cowrite-modal-btns' });
-    const ok = btns.createEl('button', { text: '开始排版' });
-    ok.addClass('mod-cta');
-    const cancel = btns.createEl('button', { text: '取消' });
-    const finish = (v: boolean | null) => {
+    // ---- 初始视图：三个选项按钮 ----
+    const optionRule = body.createEl('button', {
+      text: '📏 规则排版（纯正则，不调 LLM）',
+    });
+    optionRule.style.display = 'block';
+    optionRule.style.width = '100%';
+    optionRule.style.margin = '4px 0';
+
+    const optionSmart = body.createEl('button', {
+      text: '✨ 智能排版（调 LLM：长段拆分 / 关键词高亮 / 章节编号）',
+    });
+    optionSmart.style.display = 'block';
+    optionSmart.style.width = '100%';
+    optionSmart.style.margin = '4px 0';
+
+    const optionHtml = body.createEl('button', { text: '🎨 导出公众号 HTML（选主题后复制）' });
+    optionHtml.addClass('mod-cta');
+    optionHtml.style.display = 'block';
+    optionHtml.style.width = '100%';
+    optionHtml.style.margin = '4px 0';
+
+    const cancelLink = body.createEl('button', { text: '取消' });
+    cancelLink.style.display = 'block';
+    cancelLink.style.width = '100%';
+    cancelLink.style.margin = '8px 0 0';
+
+    const finish = (v: FormatChoice | null) => {
       if (done) return;
       done = true;
       modal.close();
       resolve(v);
     };
-    ok.addEventListener('click', () => finish(toggle.checked));
-    cancel.addEventListener('click', () => finish(null));
+
+    optionRule.addEventListener('click', () => finish({ kind: 'rule' }));
+    optionSmart.addEventListener('click', () => finish({ kind: 'smart' }));
+    cancelLink.addEventListener('click', () => finish(null));
     modal.onClose = () => finish(null);
+
+    // ---- 切到"导出 HTML"视图：主题下拉 + 复制按钮 ----
+    optionHtml.addEventListener('click', () => {
+      body.empty();
+
+      body.createEl('p', {
+        cls: 'cowrite-desc',
+        text: '选择排版主题，复制后可直接粘贴到公众号编辑器。',
+      });
+
+      const themeSel = body.createEl('select', { cls: 'cowrite-input' });
+      GZH_THEMES.forEach((t) => {
+        const opt = themeSel.createEl('option', {
+          text: `${t.name} — ${t.description}`,
+          value: t.id,
+        });
+        opt.value = t.id;
+      });
+      themeSel.value = defaultThemeId && GZH_THEMES.some((t) => t.id === defaultThemeId)
+        ? defaultThemeId
+        : 'graphite-minimal';
+
+      const copyBtn = body.createEl('button', { text: '复制到剪贴板' });
+      copyBtn.addClass('mod-cta');
+      copyBtn.style.width = '100%';
+      copyBtn.style.marginTop = '12px';
+
+      const backBtn = body.createEl('button', { text: '返回' });
+      backBtn.style.width = '100%';
+      backBtn.style.marginTop = '8px';
+
+      copyBtn.addEventListener('click', async () => {
+        copyBtn.disabled = true;
+        const origText = copyBtn.textContent ?? '复制到剪贴板';
+        try {
+          const themeId = themeSel.value;
+          const html = markdownToWechatHtml(md, themeId);
+          await navigator.clipboard.writeText(html);
+          const theme = getTheme(themeId);
+          new Notice(`已复制公众号 HTML（${theme.name}）`);
+          finish({ kind: 'html' });
+        } catch (e) {
+          new Notice(`复制失败：${parseError(e)}`, 6000);
+          copyBtn.disabled = false;
+          copyBtn.textContent = origText;
+        }
+      });
+
+      backBtn.addEventListener('click', () => {
+        finish(null);
+      });
+    });
+
     modal.open();
   });
 }
@@ -781,17 +873,75 @@ class CowriteSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           }),
       );
+    // 图像模型下拉：预置 5 个常用模型 + 自定义（选自定义显示文本框）
+    const KNOWN_IMAGE_MODELS = [
+      { v: 'dall-e-3', t: 'dall-e-3' },
+      { v: 'dall-e-2', t: 'dall-e-2' },
+      { v: 'gpt-image-1', t: 'gpt-image-1' },
+      { v: 'stable-diffusion-xl', t: 'stable-diffusion-xl' },
+      { v: 'flux-dev', t: 'flux-dev' },
+      { v: '__custom__', t: '自定义...' },
+    ] as const;
+    const knownSet = new Set<string>(KNOWN_IMAGE_MODELS.map((k) => k.v));
+    const curModel = this.plugin.settings.imageModel;
+    const initialPreset = knownSet.has(curModel) ? curModel : '__custom__';
+
+    const modelSetting = new Setting(containerEl)
+      .setName('图像模型')
+      .setDesc('选择预置模型，或选"自定义"后手动输入模型名');
+    modelSetting.addDropdown((d) => {
+      const opts: Record<string, string> = {};
+      KNOWN_IMAGE_MODELS.forEach((k) => (opts[k.v] = k.t));
+      d.addOptions(opts)
+        .setValue(initialPreset)
+        .onChange(async (v) => {
+          if (v !== '__custom__') {
+            this.plugin.settings.imageModel = v;
+            customModelInputEl.style.display = 'none';
+          } else {
+            customModelInputEl.style.display = '';
+            this.plugin.settings.imageModel = customModelInputEl.value.trim() || 'dall-e-3';
+          }
+          await this.plugin.saveSettings();
+        });
+    });
+    let customModelInputEl: HTMLInputElement;
+    modelSetting.addText((t) => {
+      t.setPlaceholder('自定义模型名，例如 sd-xl-base')
+        .setValue(initialPreset === '__custom__' ? curModel : '')
+        .onChange(async (v) => {
+          this.plugin.settings.imageModel = v.trim() || 'dall-e-3';
+          await this.plugin.saveSettings();
+        });
+      customModelInputEl = t.inputEl;
+      customModelInputEl.style.display = initialPreset === '__custom__' ? '' : 'none';
+      customModelInputEl.style.minWidth = '140px';
+    });
+
     new Setting(containerEl)
-      .setName('Image Model')
-      .setDesc('例如 dall-e-3')
-      .addText((t) =>
-        t.setPlaceholder('dall-e-3')
-          .setValue(this.plugin.settings.imageModel)
+      .setName('图像质量')
+      .setDesc('standard / hd（hd 仅 dall-e-3 支持，生成更慢更贵）')
+      .addDropdown((d) =>
+        d.addOptions({ standard: 'standard（标准）', hd: 'hd（高清）' })
+          .setValue(this.plugin.settings.imageQuality)
           .onChange(async (v) => {
-            this.plugin.settings.imageModel = v.trim() || DEFAULT_SETTINGS.imageModel;
+            this.plugin.settings.imageQuality = v === 'hd' ? 'hd' : 'standard';
             await this.plugin.saveSettings();
           }),
       );
+
+    new Setting(containerEl)
+      .setName('风格后缀')
+      .setDesc('自动拼接到每条配图 prompt 末尾；留空则不拼接')
+      .addText((t) =>
+        t.setPlaceholder('clean illustration style, soft colors, professional editorial')
+          .setValue(this.plugin.settings.imageStyleSuffix)
+          .onChange(async (v) => {
+            this.plugin.settings.imageStyleSuffix = v;
+            await this.plugin.saveSettings();
+          }),
+      );
+
     new Setting(containerEl)
       .setName('配图尺寸')
       .setDesc('所有配图位置默认使用此尺寸；16:9 为横版封面/正文图规格')
@@ -807,6 +957,24 @@ class CowriteSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           }),
       );
+
+    // ---- 公众号排版主题 ----
+    containerEl.createEl('h3', { text: '公众号排版主题' });
+    new Setting(containerEl)
+      .setName('gzh-design 主题')
+      .setDesc('导出公众号 HTML / 发布到草稿箱时使用的排版主题')
+      .addDropdown((d) => {
+        const opts: Record<string, string> = {};
+        GZH_THEMES.forEach((t) => {
+          opts[t.id] = `${t.name}（${t.description}）`;
+        });
+        d.addOptions(opts)
+          .setValue(this.plugin.settings.gzhTheme)
+          .onChange(async (v) => {
+            this.plugin.settings.gzhTheme = v || 'graphite-minimal';
+            await this.plugin.saveSettings();
+          });
+      });
 
     // ---- 公众号发布配置 ----
     containerEl.createEl('h3', { text: '公众号发布配置' });
