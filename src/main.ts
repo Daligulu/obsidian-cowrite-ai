@@ -661,52 +661,65 @@ function openFormatModal(app: App, defaultThemeId: string, md: string): Promise<
 
     const body = modal.contentEl;
 
-    // ---- 初始视图：三个选项按钮 ----
-    const optionRule = body.createEl('button', {
-      text: '📏 规则排版（纯正则，不调 LLM）',
-    });
-    optionRule.style.display = 'block';
-    optionRule.style.width = '100%';
-    optionRule.style.margin = '4px 0';
-
-    const optionSmart = body.createEl('button', {
-      text: '✨ 智能排版（调 LLM：长段拆分 / 关键词高亮 / 章节编号）',
-    });
-    optionSmart.style.display = 'block';
-    optionSmart.style.width = '100%';
-    optionSmart.style.margin = '4px 0';
-
-    const optionHtml = body.createEl('button', { text: '🎨 导出公众号 HTML（选主题后复制）' });
-    optionHtml.addClass('mod-cta');
-    optionHtml.style.display = 'block';
-    optionHtml.style.width = '100%';
-    optionHtml.style.margin = '4px 0';
-
-    const cancelLink = body.createEl('button', { text: '取消' });
-    cancelLink.style.display = 'block';
-    cancelLink.style.width = '100%';
-    cancelLink.style.margin = '8px 0 0';
-
     const finish = (v: FormatChoice | null) => {
       if (done) return;
       done = true;
       modal.close();
       resolve(v);
     };
-
-    optionRule.addEventListener('click', () => finish({ kind: 'rule' }));
-    optionSmart.addEventListener('click', () => finish({ kind: 'smart' }));
-    cancelLink.addEventListener('click', () => finish(null));
     modal.onClose = () => finish(null);
 
-    // ---- 切到"导出 HTML"视图：主题下拉 + 复制按钮 ----
-    optionHtml.addEventListener('click', () => {
+    // 弹窗内临时选中的主题：默认取设置页 gzhTheme；
+    // 视图间来回切换时保留选择，复制时用；不写回 settings。
+    const validThemeIds = new Set(GZH_THEMES.map((t) => t.id));
+    let tempThemeId = validThemeIds.has(defaultThemeId) ? defaultThemeId : 'graphite-minimal';
+
+    // ---- 视图一：三个选项按钮 ----
+    const showOptionsView = () => {
+      body.empty();
+
+      const optionRule = body.createEl('button', {
+        text: '📏 规则排版（纯正则，不调 LLM）',
+      });
+      optionRule.style.display = 'block';
+      optionRule.style.width = '100%';
+      optionRule.style.margin = '4px 0';
+
+      const optionSmart = body.createEl('button', {
+        text: '✨ 智能排版（调 LLM：长段拆分 / 关键词高亮 / 章节编号）',
+      });
+      optionSmart.style.display = 'block';
+      optionSmart.style.width = '100%';
+      optionSmart.style.margin = '4px 0';
+
+      const optionHtml = body.createEl('button', { text: '🎨 导出公众号 HTML（选主题后复制）' });
+      optionHtml.addClass('mod-cta');
+      optionHtml.style.display = 'block';
+      optionHtml.style.width = '100%';
+      optionHtml.style.margin = '4px 0';
+
+      const cancelLink = body.createEl('button', { text: '取消' });
+      cancelLink.style.display = 'block';
+      cancelLink.style.width = '100%';
+      cancelLink.style.margin = '8px 0 0';
+
+      optionRule.addEventListener('click', () => finish({ kind: 'rule' }));
+      optionSmart.addEventListener('click', () => finish({ kind: 'smart' }));
+      cancelLink.addEventListener('click', () => finish(null));
+      optionHtml.addEventListener('click', showThemeView);
+    };
+
+    // ---- 视图二：主题下拉 + 复制按钮（同一弹窗内切换） ----
+    const showThemeView = () => {
       body.empty();
 
       body.createEl('p', {
         cls: 'cowrite-desc',
         text: '选择排版主题，复制后可直接粘贴到公众号编辑器。',
       });
+
+      const label = body.createEl('div', { cls: 'cowrite-desc', text: '主题选择：' });
+      label.style.marginBottom = '4px';
 
       const themeSel = body.createEl('select', { cls: 'cowrite-input' });
       GZH_THEMES.forEach((t) => {
@@ -716,9 +729,9 @@ function openFormatModal(app: App, defaultThemeId: string, md: string): Promise<
         });
         opt.value = t.id;
       });
-      themeSel.value = defaultThemeId && GZH_THEMES.some((t) => t.id === defaultThemeId)
-        ? defaultThemeId
-        : 'graphite-minimal';
+      themeSel.value = tempThemeId;
+      themeSel.style.display = 'block';
+      themeSel.style.width = '100%';
 
       const copyBtn = body.createEl('button', { text: '复制到剪贴板' });
       copyBtn.addClass('mod-cta');
@@ -733,10 +746,10 @@ function openFormatModal(app: App, defaultThemeId: string, md: string): Promise<
         copyBtn.disabled = true;
         const origText = copyBtn.textContent ?? '复制到剪贴板';
         try {
-          const themeId = themeSel.value;
-          const html = markdownToWechatHtml(md, themeId);
+          tempThemeId = themeSel.value;
+          const html = markdownToWechatHtml(md, tempThemeId);
           await navigator.clipboard.writeText(html);
-          const theme = getTheme(themeId);
+          const theme = getTheme(tempThemeId);
           new Notice(`已复制公众号 HTML（${theme.name}）`);
           finish({ kind: 'html' });
         } catch (e) {
@@ -746,11 +759,14 @@ function openFormatModal(app: App, defaultThemeId: string, md: string): Promise<
         }
       });
 
+      // 返回：回到三选项界面，不关闭弹窗
       backBtn.addEventListener('click', () => {
-        finish(null);
+        tempThemeId = themeSel.value;
+        showOptionsView();
       });
-    });
+    };
 
+    showOptionsView();
     modal.open();
   });
 }
